@@ -15,26 +15,32 @@ from WorldModel import Flags, Conditions, Params, Positions
 from RoleMatch_LuaStyle.Skills.Skill import *
 
 
+
 """PARAMETERS BELOW"""
 class parameters:
     GOALIE_NUMBER = 0
     ARRIVAL_DIST = 150
-    ROBOT_MOUTH_RADIUS_MAX = 105 # mm
-    ROBOT_MOUTH_RADIUS_MIN = 90 # mm
+    ROBOT_MOUTH_RADIUS_MAX = 105 # mm 这个参数很重要！控制了KickOff脚本在多少的距离会从Rush转成PassToPos。
+    ROBOT_MOUTH_RADIUS_MIN = 90 # mm 没什么用的参数
     ROBOT_MOUTH_HALF_WIDTH = 30 # mm，这个是整个的宽度，但是在边缘处的情况下射球效果可能不理想
     ROBOT_RADIUS = 75 #mm
     LEAVE_THRESHOLD = 300 # 用来判断是否已经出球
+    KICK_OFF_RESIDUAL_VEL = 200 # 用来避免Double Touch的，控制的到达踢球点时与球的相对速度。
+    DEFAULT_POS = CGeoPoint(3000, 3000)
+    ALL_POSSIBLE_NUMBERS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    DEBUG_MSG_POS = CGeoPoint(0, -4000)
 """PARAMETERS ABOVE"""
 """UTIL FUNCTIONS BELOW"""
 class utils:
+    WeGotBall : bool = False
+    OurLastHolder : int = -1
+    JustKickedOff: bool = False # 用于从KickOff等脚本中继承上一次的发球车，防止任务匹配失败。
     @staticmethod
     def dot2(a, b):
         return a[0] * b[0] + a[1] * b[1]
-
     @staticmethod
     def num_mult(num, vect):
         return (vect[0] * num, vect[1] * num)
-
     @staticmethod
     def unit(vect):
         len = math.sqrt(vect[0] ** 2 + vect[1] ** 2)
@@ -60,9 +66,13 @@ class utils:
         playerpos = Player.pos(num)
         return (playerpos - position).mod() < dist
     @staticmethod
-    def is_in_mouth(role: int):
-        rx = Ball.posX() - Player.posX(role)
-        ry = Ball.posY() - Player.posY(role)
+    def is_in_mouth(role: int, isEnemy: bool):
+        if not isEnemy:
+            rx = Ball.posX() - Player.posX(role)
+            ry = Ball.posY() - Player.posY(role)
+        else:
+            rx = Ball.posX() - Enemy.posX(role)
+            ry = Ball.posY() - Enemy.posY(role)
         angle = Player.direction(role)
         dir = (math.cos(angle), math.sin(angle)) # 机器人方向向量
         norm = (-dir[1], dir[0]) # 机器人法向量
@@ -74,10 +84,42 @@ class utils:
         condit2 = (-p.ROBOT_MOUTH_HALF_WIDTH <= perp <= p.ROBOT_MOUTH_HALF_WIDTH)
         return condit1 and condit2
     @staticmethod
-    def got_ball(role: int):
-        return u.is_in_mouth(role) # 调试用。实际测试用下面带有infra的
-        return u.is_in_mouth(role) and Player.isInfraredOn(role)
-
+    def got_ball(role: int, isEnemy: bool = False): # 用来检测有没有拿到球
+        return u.is_in_mouth(role, isEnemy) # 调试用。实际测试用下面带有infra的
+        if not isEnemy:
+            return u.is_in_mouth(role, isEnemy) and Player.isInfraredOn(role) # 实车用
+        else :
+            return u.is_in_mouth(role, isEnemy) # 敌方的infrared无法访问
+    @staticmethod
+    def toVector(length: float, angle: float): # 用来把极坐标转换成直角坐标，返回CVector
+        return CVector(length * math.cos(angle), length * math.sin(angle))
+    @staticmethod
+    def allPlayerStatus(): # 返回字典 {车号i:车号i是否正在控球} 并且刷新上次拿球者
+        players = Player.getAllValidNumbers()
+        statuses = {}
+        for i in players:
+            statuses[i] = u.got_ball(i, False)
+            if statuses[i] == True:
+                u.OurLastHolder = i
+        
+        return statuses
+    @staticmethod
+    def allEnemyStatus(): # 返回字典 {敌方车号i:车号i是否正在控球}
+        players = [i for i in p.ALL_POSSIBLE_NUMBERS if Enemy.valid(i)]
+        statuses = {}
+        for i in players:
+            statuses[i] = u.got_ball(i, True)
+        return statuses
+    @classmethod
+    def refreshHaveBallStatus(cls): # 必须每个State的transFunction都反复调用，否则就没用。实时刷新才能用！
+        ps = cls.allPlayerStatus()
+        for i in ps:
+            if ps[i] == True:
+                cls.WeGotBall = True
+        es = cls.allEnemyStatus() # 如果双方都有控球，那么说明在争夺球权，此时不认为WeGotBall
+        for i in es:
+            if es[i] == True:
+                cls.WeGotBall = False
 """UTIL FUNCTIONS ABOVE"""
 """SELF-DEFINED SKILLS BELOW"""
 class skills:
@@ -87,96 +129,81 @@ p = parameters
 u = utils
 s = skills
 
-
-class GO_FORWARD(State):
-
-    @override
-    def getMatchString(self) -> str:
-        return "(AG)"
-
-    @override
-    def getTasks(self) -> "dict[str, Task]":
-        return {
-            # # "A": Task(SimpleGoTo(C.CGeoPoint(1000, -500), 0, 0)),
-            # # "B": Task(SimpleGoTo(C.CGeoPoint(1000, 500), 0, 0)),
-            # #"C": Task(SimpleGoTo(CGeoPoint(1000, 1000), 0, 0)),
-            # "C": Task(Skill.RushTo(Ball.pos())),
-            # "D": Task(lambda: SimpleGoTo(self.playerPos("E") + CVector(200,200), 0, 0)),
-            # "E": Task(SimpleGoTo(CGeoPoint(1000, 1500), 0, 0)),
-            # "G": Task(SimpleGoTo(CGeoPoint(-3518,-3012), 0, 0)),
-            # "H": Task(SimpleGoTo(Player.Pos("E") + CVector(-200,-200), 0, 0)), 
-            "A": Task(Skill.NormalShoot(12700, False)),
-            "G": Task(Skill.Goalie()),
-        }
-
-    # 子类不覆写__init__方法也没问题，不会报错；如果覆写，一定要调用super().__init__()！！！
+class NormalStates :
     def __init__(self):
-        super().__init__()
+        pass
+    class StartAttack(State):
+        def getTasks(self):
+            return {}
+        def getMatchString(self) -> str:
+            return ""
+        def transFunction(self) -> str:
+            u.refreshHaveBallStatus()
+            if not u.WeGotBall : # 进攻脚本一旦发现失去球权立即进入防守
+                return "Defend"
+            if u.OurLastHolder == p.GOALIE_NUMBER:
+                return "AttackFromGoalie"
+            else :
+                return "AttackNormal"
+            return ""
+    class Defend(State):
+        def getTasks(self):
+            return {
+                "A": Task(WMarking(priority=0)),
+                "B": Task(WMarking(priority=1)),
+                "G": Task(Goalie())
+            }
+        def getMatchString(self) -> str:
+            return "[AB](G)"
+        def transFunction(self) -> str:
+            u.refreshHaveBallStatus()
+            if u.WeGotBall : # 防守脚本一旦抢到球获得球权就进入进攻脚本。
+                # TODO : 需要特殊处理双方抢球的情况
+                return "StartAttack"
+            return ""
+    class AttackFromGoalie(State):
+        def getTasks(self):
+            return {}
+        def getMatchString(self) -> str:
+            return ""
+        def transFunction(self) -> str:
+            u.refreshHaveBallStatus()
+            if not u.WeGotBall :# 进攻脚本一旦发现失去球权立即进入防守
+                return "Defend"
+            return ""
+    class AttackNormal(State):
+        def getTasks(self):
+            Atask = Task(NormalShoot(power = 12000, isChip = False))
+            return {
+                "A": Atask
+            }
+        def getMatchString(self) -> str:
+            return "(A)"
+        def transFunction(self) -> str:
+            u.refreshHaveBallStatus()
+            if not u.WeGotBall :# 进攻脚本一旦发现失去球权立即进入防守
+                return "Defend"
+            return ""
+    class AttackDispicable(State):
+        def getTasks(self):
+            return {}
+        def getMatchString(self) -> str:
+            return ""
+        def transFunction(self) -> str:
+            u.refreshHaveBallStatus()
+            if not u.WeGotBall :# 进攻脚本一旦发现失去球权立即进入防守
+                return "Defend"
+            return ""
 
-    @override
-    def transFunction(self):
-        if buffered_condition(Global.ball().Pos().x() > 2000,10):
-                    return "Attack"
-        """状态转换函数：根据球的位置决定状态"""
-        if Global.ball().Pos().x() > 0:
-            return "GO_FORWARD"
-        return "GO_BACKWARD"
 
-
-class GO_BACKWARD(State):
-    @override
-    def getMatchString(self) -> str:
-        return "(GAB)"
-
-    @override
-    def getTasks(self) -> "dict[str, Task]":
-        return{
-            "A": Task(SimpleGoTo(CGeoPoint(-1000, -500), 0, 0)),
-            "B": Task(SimpleGoTo(CGeoPoint(-1000, 500), 0, 0)),
-            # "C": Task(SimpleGoTo(CGeoPoint(-1000, 1000), 0, 0)),
-            # "D": Task(lambda: SimpleGoTo(self.playerPos("E"), 0, 0)),
-            # "E": Task(SimpleGoTo(CGeoPoint(-1000, 1500), 0, 0)),
-            # "H": Task(RushTo(CGeoPoint(100,200), 3, 0)),
-            # "I": Task(lambda: RushTo(self.playerPos("H"), 3, 0)),
-            "G": Task(Skill.Goalie()), }
-
-
-    @override
-    def transFunction(self):
-        """状态转换函数：根据球的位置决定状态"""
-        if Global.ball().Pos().x() > 0:
-            return "GO_FORWARD"
-        return "GO_BACKWARD"
-
-
-
-
-class Attack(State):
-
-    def getMatchString(self) -> str:
-        return "(GAB)"
-
-    def getTasks(self) -> "dict[str, Task]":
-        return {
-            "A":Task(Skill.NormalShoot(12700, False)),
-            "B":Task(SimpleGoTo(CGeoPoint(2500,1000))),
-            "G":Task(Skill.Goalie()),
-        }
-
-    def transFunction(self) -> str:
-        if buffered_condition(Global.ball().Pos().x() < 2000,10):
-            return "GO_FORWARD"
-        return "Attack"
-
-
-# 第一个状态是最初状态（GO_FORWARD）
-START_STATE = GO_FORWARD
 
 
 @declare_state_machine(
-    START_STATE,
-    GO_BACKWARD,
-    Attack
+    NormalStates.Defend, 
+    NormalStates.StartAttack, 
+    NormalStates.AttackDispicable, 
+    NormalStates.AttackFromGoalie, 
+    NormalStates.AttackNormal
 )
 class ExampleNormalPlay(StateMachine):
     pass

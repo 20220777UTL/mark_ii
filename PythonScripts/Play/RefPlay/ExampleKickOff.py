@@ -26,6 +26,8 @@
 上面三行只得到计算结果，还需要你在状态机中给车辆安排移动或传球任务。
 """
 
+# TODO:
+# 1. 完善脚本对于Ball.isValid() == False 情况的处理
 import math
 
 import CppPackage
@@ -38,6 +40,7 @@ from RoleMatch_LuaStyle.Skills.Skill import *
 from Play.Normal.ExampleNormalPlay import parameters as p
 from Play.Normal.ExampleNormalPlay import utils as u
 from Play.Normal.ExampleNormalPlay import skills as s
+from Global import debugEngine
 
 __all__ = ["ExampleKickOff", "getKickOffPos", "getAlignPos", "receiveBias", "KickPower", "play_switch"]
 
@@ -138,7 +141,7 @@ def play_switch():
     """
     return "exit" if Conditions.isGameOn() else ""
 
-class States:
+class KickOffStates:
     kick_off_prep_pos : Any
     class KickOffPrepare(State):
         """我方开球占位状态，在 getTasks 中填写具体战术。"""
@@ -146,11 +149,11 @@ class States:
         def getTasks(self):
             self.ballpos = Ball.pos()
             self.kick_off_prep_pos = getKickOffPos()
-            States.kick_off_prep_pos = self.kick_off_prep_pos
-            self.kick_off_pos = u.kick_ball_pos(self.ballpos, self.kick_off_prep_pos, prep_length=150)[1]
+            KickOffStates.kick_off_prep_pos = self.kick_off_prep_pos
+            self.kick_off_pos = u.kick_ball_pos(self.ballpos, self.kick_off_prep_pos, prep_length=300)[1]
             return {
-                "A": Task(SmartGoTo(target = self.kick_off_prep_pos, dir = (self.ballpos - self.kick_off_prep_pos).dir(), flag = Flags.quickly|Flags.dodge_ball)), #Prepare to receive the ball
-                "B": Task(SmartGoTo(target = self.kick_off_pos, dir = (self.kick_off_prep_pos - self.ballpos).dir(), flag = Flags.quickly|Flags.dodge_ball)),
+                "A": Task(SmartGoTo(target = self.kick_off_prep_pos, dir = (self.ballpos - self.kick_off_prep_pos).dir(), flag = Flags.quickly)), #Prepare to receive the ball
+                "B": Task(SmartGoTo(target = self.kick_off_pos, dir = (self.kick_off_prep_pos - self.ballpos).dir(), flag = Flags.quickly)),
                 "G": Task(Goalie())
             }
 
@@ -167,19 +170,52 @@ class States:
             return ""
 
     class KickOff(State):
+        
         def __init__(self):
             super().__init__()
+            self.reset()
+
+        def reset(self):
+            u.WeGotBall = True
+            u.JustKickedOff = True
             self.Bpassed = False
+            self.BGotBall = False
+            self.AGotBall = False
             self.kick_off_prep_pos = None
+
+        def run(self, isStateSwitched):
+            if isStateSwitched:
+                self.reset()
+            return super().run(isStateSwitched)
         def getTasks(self):
             self.ballpos = Ball.pos()
-            self.kick_off_prep_pos = States.kick_off_prep_pos
-            self.kick_off_pos = u.kick_ball_pos(self.ballpos, self.kick_off_prep_pos, prep_length=p.ROBOT_MOUTH_RADIUS_MIN)[1]
-            self.Btask = Task(PassToPos(self.kick_off_prep_pos)) if not self.Bpassed else Task(SmartGoTo(target=CGeoPoint(3000,3000), dir=0))
+            self.kick_off_prep_pos = KickOffStates.kick_off_prep_pos
+            self.kick_off_angle, self.kick_off_pos = u.kick_ball_pos(self.ballpos, self.kick_off_prep_pos, prep_length=p.ROBOT_MOUTH_RADIUS_MIN - 40)
+            self.residual_vel = u.toVector(p.KICK_OFF_RESIDUAL_VEL, self.kick_off_angle)
+
+            if not self.Bpassed:
+                self.Atask = Task(RushTo(self.kick_off_prep_pos, angle = (self.kick_off_pos - self.kick_off_prep_pos).dir(), needDribble=True)) #receive the ball
+            else:
+                self.Atask = Task(RushTo(self.ballpos, angle = (self.kick_off_pos - self.kick_off_prep_pos).dir(), needDribble=True))
+            
+            if not self.BGotBall: #如果还没有拿到球
+                self.Btask = Task(RushTo(self.kick_off_pos, self.kick_off_angle, vel = self.residual_vel, needDribble=True)) # 去拿球
+                # self.Btask = Task(GetBall(flag = Flags.quickly))
+            elif not self.Bpassed : #如果拿到球了但是还没传
+                # self.Btask = Task(JustKick(power = evalPower(Ball.rawPos(), self.kick_off_prep_pos, P.NORMAL), isChip=False, needDribble=True))
+                self.Btask = Task(PassToPos(pos=self.kick_off_prep_pos, kickpower=7000))
+            else: # 如果已经传了
+                self.Btask = Task(SimpleGoTo(p.DEFAULT_POS))
+
+            debugEngine.gui_debug_msg(
+                p = p.DEBUG_MSG_POS,
+                msgstr=f"BGotBall={self.BGotBall},\nBpassed={self.Bpassed}",
+                debug_color=3
+            )
             
             return {
-                "A": Task(RushTo(self.kick_off_prep_pos, angle = (self.kick_off_pos - self.kick_off_prep_pos).dir(), needDribble=True)), #receive the ball
-                "B": Task(PassToPos(self.kick_off_prep_pos)),
+                "A": self.Atask,
+                "B": self.Btask,
                 "G": Task(Goalie())
             }
 
@@ -190,13 +226,17 @@ class States:
             
             Anum = self.playerNum("A")
             Bnum = self.playerNum("B")
-            self.Bpassed = (Player.pos(Bnum) - self.ballpos).mod() < p.LEAVE_THRESHOLD
-            AGotBall = u.is_in_mouth(Anum)
-            if(self.Bpassed and AGotBall):
+            u.OurLastHolder = Bnum
+            if not self.BGotBall: # B 拿到球了 不会重新变成False
+                self.BGotBall = u.got_ball(Bnum)
+            if self.BGotBall and not self.Bpassed:
+                self.Bpassed = (Player.pos(Bnum) - self.ballpos).mod() > p.LEAVE_THRESHOLD
+            self.AGotBall = u.got_ball(Anum)
+            if(self.Bpassed and self.AGotBall): # B 传出去 并且 A 拿到球 离开 KickOff脚本
                 return "exit"
             return ""
 
-@declare_state_machine(States.KickOffPrepare, States.KickOff)
+@declare_state_machine(KickOffStates.KickOffPrepare, KickOffStates.KickOff)
 class ExampleKickOff(StateMachine):
     pass
     """供裁判策略调度使用的我方开球状态机。"""
