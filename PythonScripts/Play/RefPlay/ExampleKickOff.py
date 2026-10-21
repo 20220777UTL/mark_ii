@@ -33,7 +33,11 @@ from Geometry import CGeoPoint, CVector
 from Vision import Ball
 from WorldModel import Conditions
 from WorldModel.PowerCalculator import P, evalPower
-from RoleMatch_LuaStyle import State, StateMachine, declare_state_machine
+from RoleMatch_LuaStyle import State, StateMachine, declare_state_machine, Task
+from RoleMatch_LuaStyle.Skills.Skill import *
+from Play.Normal.ExampleNormalPlay import parameters as p
+from Play.Normal.ExampleNormalPlay import utils as u
+from Play.Normal.ExampleNormalPlay import skills as s
 
 __all__ = ["ExampleKickOff", "getKickOffPos", "getAlignPos", "receiveBias", "KickPower", "play_switch"]
 
@@ -134,21 +138,65 @@ def play_switch():
     """
     return "exit" if Conditions.isGameOn() else ""
 
+class States:
+    kick_off_prep_pos : Any
+    class KickOffPrepare(State):
+        """我方开球占位状态，在 getTasks 中填写具体战术。"""
+        
+        def getTasks(self):
+            self.ballpos = Ball.pos()
+            self.kick_off_prep_pos = getKickOffPos()
+            States.kick_off_prep_pos = self.kick_off_prep_pos
+            self.kick_off_pos = u.kick_ball_pos(self.ballpos, self.kick_off_prep_pos, prep_length=150)[1]
+            return {
+                "A": Task(SmartGoTo(target = self.kick_off_prep_pos, dir = (self.ballpos - self.kick_off_prep_pos).dir(), flag = Flags.quickly|Flags.dodge_ball)), #Prepare to receive the ball
+                "B": Task(SmartGoTo(target = self.kick_off_pos, dir = (self.kick_off_prep_pos - self.ballpos).dir(), flag = Flags.quickly|Flags.dodge_ball)),
+                "G": Task(Goalie())
+            }
 
-class KickOffState(State):
-    """我方开球占位状态，在 getTasks 中填写具体战术。"""
+        def getMatchString(self):
+            return "(GAB)"
 
-    def getTasks(self):
-        return {}
+        def transFunction(self):
+            Anum = self.playerNum("A")
+            Bnum = self.playerNum("B")
+            Aarrive = u.arrive_at(self.kick_off_prep_pos, Anum)
+            Barrive = u.arrive_at(self.kick_off_pos, Bnum)
+            if(Aarrive and Barrive and Conditions.isNormalStart()):
+                return "KickOff"
+            return ""
 
-    def getMatchString(self):
-        return ""
+    class KickOff(State):
+        def __init__(self):
+            super().__init__()
+            self.Bpassed = False
+            self.kick_off_prep_pos = None
+        def getTasks(self):
+            self.ballpos = Ball.pos()
+            self.kick_off_prep_pos = States.kick_off_prep_pos
+            self.kick_off_pos = u.kick_ball_pos(self.ballpos, self.kick_off_prep_pos, prep_length=p.ROBOT_MOUTH_RADIUS_MIN)[1]
+            self.Btask = Task(PassToPos(self.kick_off_prep_pos)) if not self.Bpassed else Task(SmartGoTo(target=CGeoPoint(3000,3000), dir=0))
+            
+            return {
+                "A": Task(RushTo(self.kick_off_prep_pos, angle = (self.kick_off_pos - self.kick_off_prep_pos).dir(), needDribble=True)), #receive the ball
+                "B": Task(PassToPos(self.kick_off_prep_pos)),
+                "G": Task(Goalie())
+            }
 
-    def transFunction(self):
-        return play_switch()
+        def getMatchString(self):
+            return "(GAB)"
 
+        def transFunction(self):
+            
+            Anum = self.playerNum("A")
+            Bnum = self.playerNum("B")
+            self.Bpassed = (Player.pos(Bnum) - self.ballpos).mod() < p.LEAVE_THRESHOLD
+            AGotBall = u.is_in_mouth(Anum)
+            if(self.Bpassed and AGotBall):
+                return "exit"
+            return ""
 
-@declare_state_machine(KickOffState)
+@declare_state_machine(States.KickOffPrepare, States.KickOff)
 class ExampleKickOff(StateMachine):
     pass
     """供裁判策略调度使用的我方开球状态机。"""

@@ -26,6 +26,9 @@ from Geometry import CGeoPoint
 from Vision import Ball, Enemy
 from WorldModel import Conditions, Params
 from RoleMatch_LuaStyle import State, StateMachine, declare_state_machine
+from Play.Normal.ExampleNormalPlay import parameters as p
+from Play.Normal.ExampleNormalPlay import utils as u
+from Play.Normal.ExampleNormalPlay import skills as s
 
 
 __all__ = ["ExampleKickOffDefend", "Leftpos", "Rightpos", "OTHER_POS", "EnemyBestRobot", "play_switch"]

@@ -15,7 +15,7 @@ from Play.RefPlay.OurTimeout import OurTimeout
 from Play.Test.ExampleTest import ExampleTest
 
 
-Global.isTestMode = True
+Global.isTestMode = False
 Global.needDetailedRuntimeDebugInfo = False
 # 本届 3V3 的默认车号；按实际队伍修改。设为 None 可恢复按全部有效车辆匹配。
 Global.controlledRobotNumbers = (0, 1, 2)

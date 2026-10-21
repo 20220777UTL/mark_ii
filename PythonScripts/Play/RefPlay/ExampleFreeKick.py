@@ -51,7 +51,12 @@ from Utils import Normalize, Polar2Vector
 from Vision import Ball, Enemy, Player
 from WorldModel import Conditions, Params, Positions
 from WorldModel.PowerCalculator import P, evalPower
-from RoleMatch_LuaStyle import State, StateMachine, declare_state_machine
+from RoleMatch_LuaStyle import State, StateMachine, declare_state_machine, Task
+from Play.Normal.ExampleNormalPlay import parameters as p
+from Play.Normal.ExampleNormalPlay import utils as u
+from Play.Normal.ExampleNormalPlay import skills as s
+
+
 
 __all__ = [
     "ExampleFreeKick",
@@ -250,7 +255,7 @@ def IsTooCloseToTheirPenalty(pos, buffer=250):
     return (pos.x() >= Params.pitchLength / 2 - Params.penaltyDepth - buffer
             and abs(pos.y()) <= Params.penaltyWidth / 2 + buffer)
 
-
+# Useless
 def shouldUseChipKick(x_threshold=CHIP_X_THRESHOLD):
     """球的当前 x < x_threshold mm 时返回 True；否则 False。
 
@@ -305,7 +310,7 @@ def _is_our_blocked(start, end, threshold_distance, exclude_num):
             return True
     return False
 
-
+# Good
 def getDirectShootDir(shooter, *, min_ball_x=2000, side_margin=120,
                       sample_count=10, block_threshold=200):
     """采样对方球门，返回可直射方向 float（rad）；找不到则返回 None。
@@ -441,10 +446,15 @@ def play_switch():
     return "exit" if Conditions.isGameOn() else ""
 
 
+def get_the_other_attacker(number: int):
+    pass
+    
+
 class FreeKickState(State):
     """我方任意球占位状态，在 getTasks 中填写具体战术。"""
 
     def getTasks(self):
+
         return {}
 
     def getMatchString(self):

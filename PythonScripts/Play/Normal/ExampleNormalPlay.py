@@ -13,6 +13,81 @@ from Vision import *
 from Vision import Enemy
 from WorldModel import Flags, Conditions, Params, Positions
 from RoleMatch_LuaStyle.Skills.Skill import *
+
+
+"""PARAMETERS BELOW"""
+class parameters:
+    GOALIE_NUMBER = 0
+    ARRIVAL_DIST = 150
+    ROBOT_MOUTH_RADIUS_MAX = 105 # mm
+    ROBOT_MOUTH_RADIUS_MIN = 90 # mm
+    ROBOT_MOUTH_HALF_WIDTH = 30 # mm，这个是整个的宽度，但是在边缘处的情况下射球效果可能不理想
+    ROBOT_RADIUS = 75 #mm
+    LEAVE_THRESHOLD = 300 # 用来判断是否已经出球
+"""PARAMETERS ABOVE"""
+"""UTIL FUNCTIONS BELOW"""
+class utils:
+    @staticmethod
+    def dot2(a, b):
+        return a[0] * b[0] + a[1] * b[1]
+
+    @staticmethod
+    def num_mult(num, vect):
+        return (vect[0] * num, vect[1] * num)
+
+    @staticmethod
+    def unit(vect):
+        len = math.sqrt(vect[0] ** 2 + vect[1] ** 2)
+        if len == 0:
+            return None
+        return (vect[0] / len, vect[1] / len)
+    @staticmethod
+    def kick_ball_pos(ballpos: CGeoPoint, target: CGeoPoint, prep_length: float = 100):
+        """返回 (出球朝向, 准备位置)：沿球指向 target 的反方向后退 prep_length。
+
+        prep_length 单位为 mm；准备位置是机器人中心的目标点。
+        球与 target 重合时无法定义出球方向，沿用 point_angle 的异常处理。
+        """
+        angle = (target - ballpos).dir()
+        ret_pos = CGeoPoint(
+            ballpos.x() - math.cos(angle) * prep_length,
+            ballpos.y() - math.sin(angle) * prep_length,
+        )
+        return angle, ret_pos
+
+    @staticmethod
+    def arrive_at(position: CGeoPoint, num: int, dist: float = parameters.ARRIVAL_DIST):
+        playerpos = Player.pos(num)
+        return (playerpos - position).mod() < dist
+    @staticmethod
+    def is_in_mouth(role: int):
+        rx = Ball.posX() - Player.posX(role)
+        ry = Ball.posY() - Player.posY(role)
+        angle = Player.direction(role)
+        dir = (math.cos(angle), math.sin(angle)) # 机器人方向向量
+        norm = (-dir[1], dir[0]) # 机器人法向量
+        para = u.dot2(dir, (rx, ry)) # 机器人朝向方向，球在哪个位置
+        condit1 = (p.ROBOT_MOUTH_RADIUS_MIN <= para <= p.ROBOT_MOUTH_RADIUS_MAX)
+        perpx = rx - para * dir[0] 
+        perpy = ry - para * dir[1]
+        perp = u.dot2(norm, (perpx, perpy)) # 机器人法向方向，球的位置
+        condit2 = (-p.ROBOT_MOUTH_HALF_WIDTH <= perp <= p.ROBOT_MOUTH_HALF_WIDTH)
+        return condit1 and condit2
+    @staticmethod
+    def got_ball(role: int):
+        return u.is_in_mouth(role) # 调试用。实际测试用下面带有infra的
+        return u.is_in_mouth(role) and Player.isInfraredOn(role)
+
+"""UTIL FUNCTIONS ABOVE"""
+"""SELF-DEFINED SKILLS BELOW"""
+class skills:
+    pass
+"""SELF-DEFINED SKILLS ABOVE"""
+p = parameters
+u = utils
+s = skills
+
+
 class GO_FORWARD(State):
 
     @override
@@ -95,9 +170,11 @@ class Attack(State):
 
 
 # 第一个状态是最初状态（GO_FORWARD）
-# todo: start state
+START_STATE = GO_FORWARD
+
+
 @declare_state_machine(
-    GO_FORWARD,
+    START_STATE,
     GO_BACKWARD,
     Attack
 )
