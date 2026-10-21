@@ -24,17 +24,32 @@ class parameters:
     ROBOT_MOUTH_RADIUS_MIN = 90 # mm 没什么用的参数
     ROBOT_MOUTH_HALF_WIDTH = 30 # mm，这个是整个的宽度，但是在边缘处的情况下射球效果可能不理想
     ROBOT_RADIUS = 75 #mm
+    ROBOT_MAX_ACC = 1000 #mm/s^2
     LEAVE_THRESHOLD = 300 # 用来判断是否已经出球
     KICK_OFF_RESIDUAL_VEL = 200 # 用来避免Double Touch的，控制的到达踢球点时与球的相对速度。
     DEFAULT_POS = CGeoPoint(3000, 3000)
     ALL_POSSIBLE_NUMBERS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     DEBUG_MSG_POS = CGeoPoint(0, -4000)
+    DEFAULT_PASS_MAX_BALL_VELOCITY = 3500
+    DPMBV = DEFAULT_PASS_MAX_BALL_VELOCITY
+
 """PARAMETERS ABOVE"""
 """UTIL FUNCTIONS BELOW"""
 class utils:
     WeGotBall : bool = False
-    OurLastHolder : int = -1
+    # We Got Ball 的定义：
+    # 如果发生暂停，WeGotBall为False。
+    # 如果当前在活球状态，那么已经开球，一定存在上一个持球者。上一个持球者如果不是我方球员，WeGotBall=False。
+    # 更新逻辑：每个NormalPlay状态在transfunc中用refresh。每个RefPlay脚本在开球状态初始化的时候就修改。
+    OurLastHolder : int = -1 
+    # Our Last Holder 的定义：如果当前非我方控球，OurLastHolder = -1。
+    # 如果当前为我方控球，一定存在上一次我方持球，记录上一次是谁持球。
+    # 如果当前不是我方控球
+    # Our Last Holder 的维护逻辑：
+    # 当有我方球员接球，刷新OurLastHolder为上一个持球者。
+    # 当丢球，OurLastHolder = -1
     JustKickedOff: bool = False # 用于从KickOff等脚本中继承上一次的发球车，防止任务匹配失败。
+    # JustKickedOff 的定义：如果开球之后还没有其他球员触球，也没有发生暂停，那么JustKickedOff = True。否则为False.
     @staticmethod
     def dot2(a, b):
         return a[0] * b[0] + a[1] * b[1]
@@ -112,14 +127,83 @@ class utils:
         return statuses
     @classmethod
     def refreshHaveBallStatus(cls): # 必须每个State的transFunction都反复调用，否则就没用。实时刷新才能用！
+        # 当前实现中会在NormalPlay的每个时刻都调取。
         ps = cls.allPlayerStatus()
         for i in ps:
             if ps[i] == True:
                 cls.WeGotBall = True
+                cls.OurLastHolder = i
         es = cls.allEnemyStatus() # 如果双方都有控球，那么说明在争夺球权，此时不认为WeGotBall
         for i in es:
             if es[i] == True:
                 cls.WeGotBall = False
+                cls.OurLastHolder = -1
+    @staticmethod
+    def whetherIntersect(start_segment_1: CGeoPoint, end_segment_1: CGeoPoint, start_segment_2: CGeoPoint, end_segement_2: CGeoPoint)->bool:
+        # Detects parallel, mainly for avoiding dividing by zero.
+        P, Q, R, S = start_segment_1, end_segment_1, start_segment_2, end_segement_2
+        xP, yP = P.x(), P.y()
+        xQ, yQ = Q.x(), Q.y()
+        xR, yR = R.x(), R.y()
+        xS, yS = S.x(), S.y()
+        term1 = (xQ - xP) * (yR - yS)
+        term2 = (xR - xS) * (yQ - yP)
+        if math.isclose(term1, term2, rel_tol=1e-7, abs_tol=1e-4) :
+            return False
+        #计算参数方程(xR + t(xS - xR), yR + t(yS - yR))在直线PQ上的解。判断t是否在(0,1)之间，如果是则相交。
+        t = (
+            (xR - xP) * (yQ - yP) - (xQ - xP) * (yR - yP)
+        ) / (
+            (xS - xR) * (yQ - yP) - (yS - yR) * (xQ - xP)
+        )
+        if 0 < t < 1:
+            return True
+        else:
+            return False
+
+    @staticmethod
+    def projectOntoLine(point: CGeoPoint, start_line: CGeoPoint, end_line: CGeoPoint):
+        P, Q, A = start_line, end_line, point
+        if (P - Q).mod() < 1:
+            return None # 两个端点太近
+        if (Q - A).mod() < 1: # 离端点太近
+            return Q
+        if (P - A).mod() < 1:
+            return P
+        if -1e-2 < (Q - A).dir() - (P - A).dir() < 1e-2:
+            return A # 近似共线
+        t = - u.dot2((Q-P), (P-A)) / (u.dot2((P-Q), (P-Q)))
+        return P + t * (Q - P)
+
+    @staticmethod
+    def whetherBlockedByMovingEnemy(start:CGeoPoint, end:CGeoPoint, enemyPos: CGeoPoint, enemyVel: CVector, timeplus: float = 0): # timeplus 表示多久之后传出来
+        # 先将敌人位置投影到start->end的直线上，计算留给敌人的反应时间。
+        toEnemy = enemyPos - start
+        toEnd = end - start
+        if not (- math.pi / 3) < (toEnd.dir() - toEnemy.dir()) < (math.pi / 3):
+            return False # 夹角大于60度，不会阻挡
+        if toEnemy.mod() < 150:
+            return True # 夹角小于等于60度，并且距离太小，阻挡
+        proj = u.projectOntoLine(enemyPos, start, end)
+        if proj == None:
+            raise ValueError
+        reactionTime = (proj - start).mod() / p.DPMBV + timeplus # seconds
+        ddx = p.ROBOT_MAX_ACC * (reactionTime ** 2) / 2
+        dx = reactionTime * enemyVel.mod()
+        if (-0.5 < enemyVel.dir() - toEnd.dir() < 0.5): # 
+            return (enemyPos-proj).mod() < ddx
+        P1 = enemyPos + u.toVector(dx + ddx, enemyVel.dir())
+        P2 = enemyPos + u.toVector(dx - ddx, enemyVel.dir())
+        return u.whetherIntersect(
+            P1, P2,
+            start, end
+        )
+    
+        
+
+        
+        
+
 """UTIL FUNCTIONS ABOVE"""
 """SELF-DEFINED SKILLS BELOW"""
 class skills:
@@ -148,10 +232,11 @@ class NormalStates :
             return ""
     class Defend(State):
         def getTasks(self):
+            # TODO : WMarking 如何做到让两个车都去防守？现在只有一个车在防守，Goalie和B都呆在那里。
             return {
                 "A": Task(WMarking(priority=0)),
-                "B": Task(WMarking(priority=1)),
-                "G": Task(Goalie())
+                "B": Task(WMarking(priority=0)),
+                "G": Task(Goalie(), fixedNumber=p.GOALIE_NUMBER)
             }
         def getMatchString(self) -> str:
             return "[AB](G)"
@@ -163,7 +248,10 @@ class NormalStates :
             return ""
     class AttackFromGoalie(State):
         def getTasks(self):
-            return {}
+            goalieTask = asdfas
+            return {
+                "G": Task(Goalie(), fixedNumber=p.GOALIE_NUMBER)
+            }
         def getMatchString(self) -> str:
             return ""
         def transFunction(self) -> str:
@@ -175,10 +263,11 @@ class NormalStates :
         def getTasks(self):
             Atask = Task(NormalShoot(power = 12000, isChip = False))
             return {
-                "A": Atask
+                "A": Atask,
+                "G": Task(Goalie(), fixedNumber=p.GOALIE_NUMBER)
             }
         def getMatchString(self) -> str:
-            return "(A)"
+            return "(AG)"
         def transFunction(self) -> str:
             u.refreshHaveBallStatus()
             if not u.WeGotBall :# 进攻脚本一旦发现失去球权立即进入防守
@@ -186,9 +275,11 @@ class NormalStates :
             return ""
     class AttackDispicable(State):
         def getTasks(self):
-            return {}
+            return {
+                "G": Task(Goalie(), fixedNumber=p.GOALIE_NUMBER)
+            }
         def getMatchString(self) -> str:
-            return ""
+            return "(G)"
         def transFunction(self) -> str:
             u.refreshHaveBallStatus()
             if not u.WeGotBall :# 进攻脚本一旦发现失去球权立即进入防守

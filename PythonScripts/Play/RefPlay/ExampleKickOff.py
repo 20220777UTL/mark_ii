@@ -203,7 +203,7 @@ class KickOffStates:
                 # self.Btask = Task(GetBall(flag = Flags.quickly))
             elif not self.Bpassed : #如果拿到球了但是还没传
                 # self.Btask = Task(JustKick(power = evalPower(Ball.rawPos(), self.kick_off_prep_pos, P.NORMAL), isChip=False, needDribble=True))
-                self.Btask = Task(PassToPos(pos=self.kick_off_prep_pos, kickpower=7000))
+                self.Btask = Task(PassToPos(pos=self.kick_off_prep_pos, kickpower=5000))
             else: # 如果已经传了
                 self.Btask = Task(SimpleGoTo(p.DEFAULT_POS))
 
@@ -233,6 +233,7 @@ class KickOffStates:
                 self.Bpassed = (Player.pos(Bnum) - self.ballpos).mod() > p.LEAVE_THRESHOLD
             self.AGotBall = u.got_ball(Anum)
             if(self.Bpassed and self.AGotBall): # B 传出去 并且 A 拿到球 离开 KickOff脚本
+                
                 return "exit"
             return ""
 
