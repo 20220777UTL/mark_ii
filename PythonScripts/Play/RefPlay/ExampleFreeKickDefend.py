@@ -25,11 +25,9 @@
 import CppPackage
 from Geometry import CGeoPoint
 from Vision import Ball, Enemy
-from WorldModel import Conditions, Params
-from RoleMatch_LuaStyle import State, StateMachine, declare_state_machine
-from Play.Normal.ExampleNormalPlay import parameters as p
-from Play.Normal.ExampleNormalPlay import utils as u
-from Play.Normal.ExampleNormalPlay import skills as s
+from WorldModel import Conditions, Params, Positions, Flags
+from RoleMatch_LuaStyle import State, StateMachine, Task, declare_state_machine
+from RoleMatch_LuaStyle.Skills import Skill
 
 
 __all__ = ["ExampleFreeKickDefend", "getAttackerNum", "getFreeKickDefPos", "EnemyBestRobot", "nearest1", "play_switch"]
@@ -162,13 +160,45 @@ def play_switch():
 
 
 class FreeKickDefendState(State):
-    """对方任意球占位状态，在 getTasks 中填写具体防守任务。"""
+    """对方任意球时，两名场上队员挡住正面和一侧传球线路。"""
 
     def getTasks(self):
-        return {}
+        tasks = {"G": Task(Skill.Goalie())}
+
+        ball = Ball.pos()
+        side, middle, other_side, side2, other_side2 = Positions.refStopAroundBall()
+
+        # 只选场内、且不在两侧禁区附近的候选点。
+        def legal(point):
+            if abs(point.x()) > Params.pitchLength / 2 - 150:
+                return False
+            if abs(point.y()) > Params.pitchWidth / 2 - 150:
+                return False
+            if abs(point.y()) < Params.penaltyWidth / 2 + 200:
+                if point.x() < -Params.pitchLength / 2 + Params.penaltyDepth + 200:
+                    return False
+                if point.x() > Params.pitchLength / 2 - Params.penaltyDepth - 200:
+                    return False
+            return True
+
+        points = [p for p in (middle, side, other_side, side2, other_side2)
+                  if legal(p)]
+        flags = (Flags.dodge_ball | Flags.dodge_referee_area |
+                 Flags.dodge_our_defense_box)
+
+        for role, point in zip(("A", "B"), points):
+            tasks[role] = Task(
+                Skill.SmartGoTo(point, (ball - point).dir(), flag=flags)
+            )
+
+        for role in ("A", "B"):
+            if role not in tasks:
+                tasks[role] = Task(Skill.Stop())
+
+        return tasks
 
     def getMatchString(self):
-        return ""
+        return "(AB)"
 
     def transFunction(self):
         return play_switch()

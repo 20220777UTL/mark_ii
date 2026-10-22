@@ -100,7 +100,7 @@ class utils:
         return condit1 and condit2
     @staticmethod
     def got_ball(role: int, isEnemy: bool = False): # 用来检测有没有拿到球
-        return u.is_in_mouth(role, isEnemy) # 调试用。实际测试用下面带有infra的
+        # return u.is_in_mouth(role, isEnemy) # 调试用。实际测试用下面带有infra的
         if not isEnemy:
             return u.is_in_mouth(role, isEnemy) and Player.isInfraredOn(role) # 实车用
         else :
@@ -198,11 +198,6 @@ class utils:
             P1, P2,
             start, end
         )
-    
-        
-
-        
-        
 
 """UTIL FUNCTIONS ABOVE"""
 """SELF-DEFINED SKILLS BELOW"""
