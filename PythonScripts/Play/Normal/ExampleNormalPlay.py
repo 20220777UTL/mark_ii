@@ -13,6 +13,7 @@ from Vision import *
 from Vision import Enemy
 from WorldModel import Flags, Conditions, Params, Positions
 from RoleMatch_LuaStyle.Skills.Skill import *
+import random
 
 
 
@@ -100,7 +101,7 @@ class utils:
         return condit1 and condit2
     @staticmethod
     def got_ball(role: int, isEnemy: bool = False): # 用来检测有没有拿到球
-        # return u.is_in_mouth(role, isEnemy) # 调试用。实际测试用下面带有infra的
+        return u.is_in_mouth(role, isEnemy) # 调试用。实际测试用下面带有infra的
         if not isEnemy:
             return u.is_in_mouth(role, isEnemy) and Player.isInfraredOn(role) # 实车用
         else :
@@ -198,6 +199,48 @@ class utils:
             P1, P2,
             start, end
         )
+
+    @staticmethod
+    def sample_in_rectangle(
+        left_top: CGeoPoint,
+        right_down: CGeoPoint,
+    ) -> CGeoPoint:
+        xmin, xmax = sorted((left_top.x(), right_down.x()))
+        ymin, ymax = sorted((left_top.y(), right_down.y()))
+
+        if xmin == xmax or ymin == ymax:
+            raise ValueError("矩形不能退化成线或点")
+
+        point = CGeoPoint(
+            random.uniform(xmin, xmax),
+            random.uniform(ymin, ymax),
+        )
+        return point
+
+    @staticmethod
+    def sample_in_rotated_rectangle(
+        corner: CGeoPoint,
+        neighbor_a: CGeoPoint,
+        neighbor_b: CGeoPoint,
+    ) -> CGeoPoint:
+        """在三个顶点定义的斜矩形内均匀采样。平行四边形也可以."""
+        ax = neighbor_a.x() - corner.x()
+        ay = neighbor_a.y() - corner.y()
+        bx = neighbor_b.x() - corner.x()
+        by = neighbor_b.y() - corner.y()
+
+        length_a = math.hypot(ax, ay)
+        length_b = math.hypot(bx, by)
+        if length_a == 0 or length_b == 0:
+            raise ValueError("矩形的边长必须大于 0")
+
+        u = random.random()
+        v = random.random()
+        return CGeoPoint(
+            corner.x() + u * ax + v * bx,
+            corner.y() + u * ay + v * by,
+        )
+        
 
 """UTIL FUNCTIONS ABOVE"""
 """SELF-DEFINED SKILLS BELOW"""
