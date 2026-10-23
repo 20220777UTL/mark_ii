@@ -51,12 +51,13 @@ from Utils import Normalize, Polar2Vector
 from Vision import Ball, Enemy, Player
 from WorldModel import Conditions, Params, Positions
 from WorldModel.PowerCalculator import P, evalPower
-from RoleMatch_LuaStyle import State, StateMachine, declare_state_machine, Task
-from Play.Normal.ExampleNormalPlay import parameters as p
-from Play.Normal.ExampleNormalPlay import utils as u
-from Play.Normal.ExampleNormalPlay import skills as s
+from RoleMatch_LuaStyle import State, StateMachine, declare_state_machine
 
-
+# 新增：基础任意球所需的官方接口。
+import Global
+from RoleMatch_LuaStyle import Task
+from RoleMatch_LuaStyle.Skills import Skill
+from WorldModel import Flags
 
 __all__ = [
     "ExampleFreeKick",
@@ -255,7 +256,7 @@ def IsTooCloseToTheirPenalty(pos, buffer=250):
     return (pos.x() >= Params.pitchLength / 2 - Params.penaltyDepth - buffer
             and abs(pos.y()) <= Params.penaltyWidth / 2 + buffer)
 
-# Useless
+
 def shouldUseChipKick(x_threshold=CHIP_X_THRESHOLD):
     """球的当前 x < x_threshold mm 时返回 True；否则 False。
 
@@ -310,7 +311,7 @@ def _is_our_blocked(start, end, threshold_distance, exclude_num):
             return True
     return False
 
-# Good
+
 def getDirectShootDir(shooter, *, min_ball_x=2000, side_margin=120,
                       sample_count=10, block_threshold=200):
     """采样对方球门，返回可直射方向 float（rad）；找不到则返回 None。
@@ -446,21 +447,93 @@ def play_switch():
     return "exit" if Conditions.isGameOn() else ""
 
 
-def get_the_other_attacker(number: int):
-    pass
-    
-
 class FreeKickState(State):
     """我方任意球占位状态，在 getTasks 中填写具体战术。"""
 
     def getTasks(self):
+        # 新增：每次进入任意球重新选点，选到后本次传球保持不变。
+        if Global.isPlaySwitched or not hasattr(self, "stage"):
+            self.stage = "wait_first"
+            self.receive_pos = None
+            self.second_pos : CGeoPoint
 
+        if self.receive_pos is None:
+            target = getFreeKickPos(0)  # 0 是候选点编号，不是机器人编号。
+            if target is None:
+                debugEngine.gui_debug_msg(CGeoPoint(0, 2500), "FK: waiting for point")
+                return {"G": Task(Skill.Goalie()),
+                        "A": Task(Skill.Stop()), "B": Task(Skill.Stop())}
+            self.receive_pos = CGeoPoint(target.x(), target.y())
+            self.pass_dir = Ball.toPointDir(self.receive_pos)
+            ball_pos = Ball.pos()
+            # 我方球门在负 x 方向：第一点从球向我方球门退 400 mm。
+            # 靠近我方底线时缩短这段距离，让车中心至少留在底线内一个车半径。
+            first_x = max(ball_pos.x() - 400,
+                          Positions.ourGoal.x() + Params.playerRadius + 10)
+            first_dy = 100 if ball_pos.y() >= 0 else -100
+            self.first_pos = CGeoPoint(first_x,
+                                       ball_pos.y() + first_dy)
+
+        debugEngine.gui_debug_msg(CGeoPoint(0, 2500), f"FK: {self.stage}")
+        debugEngine.gui_debug_msg(self.receive_pos, "FK0 target", debug_color=3)
+        receive_dir = Normalize(self.pass_dir + math.pi)
+        tasks = {"G": Task(Skill.Goalie())}
+
+        # A 先到第一待球点，再到球背对 B 的第二待球点。
+        if self.stage == "wait_first":
+            tasks["A"] = Task(Skill.SimpleGoTo(
+                self.first_pos, self.pass_dir, flag=Flags.allow_dss))
+        elif self.stage == "wait_second":
+            tasks["A"] = Task(Skill.SimpleGoTo(
+                self.second_pos, self.pass_dir, flag=Flags.allow_dss))
+        elif self.stage == "pass":
+            tasks["A"] = Task(Skill.StaticGetBallV4(
+                self.receive_pos,
+                direction=Ball.toPointDir(self.receive_pos),
+                power=KickPower(self.receive_pos), isChip=False))
+        else:  # done：已踢出，A 停止本次传球。
+            tasks["A"] = Task(Skill.Stop())
+
+        # B 跑向同一个接球点，传球开始后开启吸球等待接球。
+        if self.stage in ("wait_first", "wait_second"):
+            tasks["B"] = Task(Skill.SimpleGoTo(
+                self.receive_pos, receive_dir,
+                flag=Flags.dodge_ball | Flags.allow_dss))
+        else:
+            tasks["B"] = Task(Skill.RushTo(
+                self.receive_pos, angle=receive_dir,
+                flag=Flags.allow_dss, needDribble=True))
+        return tasks
+        # 原模板占位行保留；上面已经返回本帧任务。
         return {}
 
     def getMatchString(self):
+        # 准备时动态匹配 A/B；开始对准后保留本轮分工，不指定实际车号。
+        return "[AB]" if self.stage == "wait_first" else "(AB)"
+        # 原模板占位行保留。
         return ""
 
     def transFunction(self):
+        if self.receive_pos is None:
+            return ""
+
+        if self.stage == "wait_first":
+            if (Player.toPointDist("A", self.first_pos) < 30
+                    and Player.toPointDist("B", self.receive_pos) < 150
+                    and Player.velMod("B") < 150):
+                self.second_pos = WaitBallPos2("B", behind_dist=150)
+                self.pass_dir = Ball.toPointDir(self.receive_pos)
+                self.stage = "wait_second"
+        elif self.stage == "wait_second":
+            if (Player.toPointDist("A", self.second_pos) < 30
+                    and Player.velMod("A") < 150
+                    and abs(Normalize(Player.direction("A") - self.pass_dir)) < 0.2):
+                self.stage = "pass"
+        elif self.stage == "pass" and Player.kickBallVision("A"):
+            self.stage = "done"
+
+        if self.stage != "done":
+            return ""
         return play_switch()
 
 
@@ -468,3 +541,7 @@ class FreeKickState(State):
 class ExampleFreeKick(StateMachine):
     pass
     """供裁判策略调度使用的我方任意球状态机。"""
+
+    def hookBeforePlanTasks(self):
+        # 由上面的 play_switch() 通知框架本次任意球结束。
+        Global.hasFinishedRefPlay = False
