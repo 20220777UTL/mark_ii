@@ -1,33 +1,20 @@
-"""对方任意球定位球策略：供 3V3 选手调用的查询、几何与退出判断接口。
+"""3V3 对方任意球防守：G 回门前，A 封主罚者射门，B 靠接应者截传球。
 
-文件末尾提供 ExampleFreeKickDefend 单状态占位，供 Config.py 导入；
-可在 FreeKickDefendState.getTasks() 填写任务，退出条件默认复用 play_switch()。
-
-3V3 共三辆车，包含一名门将和两名场上队员。本模块不分配角色，选手应在自己
-的状态机中选择接口、分配实际可用的场上队员，并处理裁判状态和视觉丢失。
-坐标、距离单位为毫米；使用视觉的我方坐标系，我方球门在负 X 方向。
-以下函数必须在运行期间调用，不能在模块导入时缓存球或对手位置。
-
-建议思路：先识别可能主罚的对手；一名场上队员封堵球到我方球门的路线，
-另一名照看危险接应者或保护门前，门将守门。对方把球开出后结束定位球防守。
-站位需要你根据规则计算，不要把查询到的对手位置直接当作我方要到达的点。
-
-查询示例（放在运行期间执行的函数中）：
-    from Play.RefPlay.ExampleFreeKickDefend import EnemyBestRobot, getFreeKickDefPos
-    from Vision import Enemy
-    number = EnemyBestRobot()
-    opponent = Enemy.pos(number) if number >= 0 else None
-    candidate = getFreeKickDefPos(0)
-    if candidate is not None:
-        pass  # 将候选点交给自己的站位逻辑，再检查规则和避障限制。
+开球防守复用本模块的内部站位函数，只改变 B 的站位线和半场限制。
+坐标、距离单位为毫米；我方球门在负 X 方向，球和对手位置每帧查询。
+保留模板原有查询接口；查询得到的对手位置、候选点并不自动满足站位规则。
 """
 
+import math
+
 import CppPackage
+import Global
 from Geometry import CGeoPoint
-from Vision import Ball, Enemy
+from Vision import Ball, Enemy, Player
 from WorldModel import Conditions, Params, Positions, Flags
 from RoleMatch_LuaStyle import State, StateMachine, Task, declare_state_machine
 from RoleMatch_LuaStyle.Skills import Skill
+from Play.RefPlay.OfficialSupport import disable_ball_actions, stop_tasks
 
 
 __all__ = ["ExampleFreeKickDefend", "getAttackerNum", "getFreeKickDefPos", "EnemyBestRobot", "nearest1", "play_switch"]
@@ -135,69 +122,173 @@ def nearest1(reference=None, rank=1):
 
 
 def play_switch():
-    """按原任意球防守的退出条件，判断何时结束定位球流程。
+    """只按平台的活球判断退出，避免把球的视觉抖动当成开球完成。"""
+    return "exit" if Conditions.isGameOn() else ""
 
-    先判断球已移动且当前不是 GameStop，再判断比赛是否进入进行中；
-    任一成立时返回 "exit"，否则返回空字符串，继续当前状态。
-    ballMoved() 表示球相对裁判基准位置移动超过 300 mm，并排除双方摆球。
 
-    本函数只提供退出判断，不生成任务、不控制车辆。
-    选手可以根据自己的战术补充其他结束条件。
-    返回 "exit" 后，是否进入常规比赛仍由外层裁判调度决定。
+def _kicker_block_pos(ball, kicker, distance):
+    """默认挡球到门中心；主罚者贴球且面向门框时，改挡其朝向射线。"""
+    direction = (Positions.ourGoal - ball).dir()
+    if kicker >= 0 and Enemy.pos(kicker).dist(ball) < 300:
+        angle = Enemy.dir(kicker)  # 视觉接口直接提供弧度，无需另写朝向识别。
+        dx, dy = math.cos(angle), math.sin(angle)
+        if dx < -0.01:
+            t = (Positions.ourGoal.x() - ball.x()) / dx
+            goal_y = ball.y() + t * dy
+            if t > 0 and abs(goal_y) <= Params.goalWidth / 2:
+                direction = angle
+    return ball + CppPackage.Polar2Vector(distance, direction)
 
-    它不是开球许可判断。我方开球不能等待 isGameOn() 成立才第一次踢球，
-    应按当前定位球策略的开球许可条件开始动作。
 
-    调用示例：在自己的定位球策略中从本模块导入 play_switch 后：
-        def transFunction(self):
-            return play_switch()
+def _legal_defend_pos(point, ball, kickoff, *, goalie=False, occupied=()):
+    """用底层几何接口修正目标；最终检查全部约束，失败则退到补防点。
+
+    距离均为车中心距离：规则距离之外再加车半径和 60 mm 余量。
+    多个投影可能互相影响，因此不能只调用一次避球/避禁区就直接下发。
+    occupied 是本帧已经分配的站位，避免两名队员占同一点。
     """
-    if Conditions.ballMoved() and not Conditions.isGameStop():
-        return "exit"
-    if Conditions.isGameOn():
-        return "exit"
-    return ""
+    margin = Params.playerRadius + 60
+    ball_gap = max(500, Params.freeKickAvoidBallDist) + margin
+    separation = 2 * Params.playerRadius + 60
+    enemies = [Enemy.pos(n) for n in range(Params.maxPlayer) if Enemy.valid(n)]
+    # 门将只能在门前选点，不能套用场上队员的侧翼补防点。
+    # 原先共用 backups，门前点被拒绝时 G 会直接跑到场地四分之一处。
+    if goalie:
+        post_limit = max(0, Params.goalWidth / 2 - margin)
+        backups = [CGeoPoint(Positions.ourGoal.x() + margin, y)
+                   for y in (0, -post_limit, post_limit)]
+    else:
+        backups = [CGeoPoint(-Params.pitchLength / 4, side * Params.pitchWidth / 4)
+                   for side in (-1, 1)]
+    for candidate in [point, *backups]:
+        for _ in range(3):
+            candidate = CppPackage.MakeInField(candidate, margin)
+            if not goalie and CppPackage.InOurPenaltyArea(candidate, margin):
+                candidate = CppPackage.MakeOutOfOurPenaltyArea(candidate, margin + 1)
+            if CppPackage.InTheirPenaltyArea(candidate, 200 + margin):
+                candidate = CppPackage.MakeOutOfTheirPenaltyArea(candidate, 200 + margin + 1)
+            # 门前点若位于禁球圆内，尝试另一个门前点，不能把 G 沿圆推向场内。
+            if goalie:
+                break
+            if kickoff:
+                candidate = CGeoPoint(min(candidate.x(), -margin), candidate.y())
+                candidate = CppPackage.MakeOutOfCircleAndInField(
+                    CGeoPoint(0, 0), 500 + margin, candidate, 0)
+            candidate = CppPackage.MakeOutOfCircleAndInField(ball, ball_gap, candidate, 0)
+
+        # 球、禁区及边界约束必须同时成立；禁区修正后仍可能重新进入禁球圆。
+        if not (math.isfinite(candidate.x()) and math.isfinite(candidate.y())):
+            continue
+        if (abs(candidate.x()) > Params.pitchLength / 2 - margin
+                or abs(candidate.y()) > Params.pitchWidth / 2 - margin
+                or candidate.dist(ball) < ball_gap - 0.01):
+            continue
+        if kickoff and (candidate.x() > -margin
+                        or candidate.dist(CGeoPoint(0, 0)) < 500 + margin - 0.01):
+            continue
+        if not goalie and CppPackage.InOurPenaltyArea(candidate, margin):
+            continue
+        if CppPackage.InTheirPenaltyArea(candidate, 200 + margin):
+            continue
+        if any(candidate.dist(other) < separation for other in [*occupied, *enemies]):
+            continue
+        return candidate
+    return None  # 没有合法目标时停止，不下发未检查的点。
+
+
+def _defend_tasks(*, kickoff=False):
+    """两种定位球的共用任务：G 守门、A 封射门、B 盯接应者。"""
+    # 延迟导入，避免 RefPlay 与 NormalPlay 在加载时互相引用。
+    from Play.Normal.ExampleNormalPlay import utils as u
+
+    # 对方定位球期间不保留我方上轮进攻的控球/发球者状态。
+    u.WeGotBall, u.OurLastHolder, u.JustKickedOff = False, -1, False
+    Global.hasFinishedRefPlay = False
+    disable_ball_actions()
+    if not Ball.valid():
+        return stop_tasks()
+
+    ball = Ball.pos()
+    margin = Params.playerRadius + 60
+    ball_gap = max(500, Params.freeKickAvoidBallDist) + margin
+    kicker = EnemyBestRobot()
+    # 3V3 中按当前视觉取离对方球门最近的车作为门将估计，允许门将在禁区边缘。
+    # 不用 NormalPlay 的 ENEMY_GOALIE：它默认是 0，且只在常规比赛时刷新，
+    # 会误删真正的 0 号接应者，并把非 0 号门将留在接应候选中。
+    opponents = [n for n in range(Params.maxPlayer) if Enemy.valid(n)]
+    enemy_goalie = min(opponents, key=lambda n: Enemy.pos(n).dist(Positions.theirGoal),
+                       default=-1)
+    receivers = [n for n in opponents
+                 if n != kicker and n != enemy_goalie
+                 and not CppPackage.InTheirPenaltyArea(Enemy.pos(n), 0)]
+    preferred = getAttackerNum(0) if not kickoff and receivers else -1
+    receiver = preferred if preferred in receivers else min(
+        receivers, key=lambda n: Enemy.pos(n).dist(Positions.ourGoal), default=-1)
+    # 在调试画面显示选人结果，方便直接对照场上车号定位视觉/选人问题。
+    Global.debugEngine.gui_debug_msg(CGeoPoint(0, Params.pitchWidth / 2 - 200),
+                                    f"DEF kicker={kicker} receiver={receiver} oppGK={enemy_goalie}")
+
+    a_pos = _kicker_block_pos(ball, kicker, ball_gap)
+    # 无接应者时，在球的另一侧、禁区前方补防。
+    b_pos = CGeoPoint(Positions.ourGoal.x() + Params.penaltyDepth + 2 * margin,
+                     (-1 if ball.y() >= 0 else 1) * Params.penaltyWidth / 2)
+    if receiver >= 0:
+        receive_pos = Enemy.pos(receiver)
+        # 开球：接应者到我方球门；任意球：接应者到主罚者（丢失时用球位）。
+        anchor = Positions.ourGoal if kickoff else (
+            Enemy.pos(kicker) if kicker >= 0 else ball)
+        length = receive_pos.dist(anchor)
+        if length > 1:
+            distance = min(350, length / 2)
+            if kickoff and receive_pos.x() > -margin:
+                # 沿同一条线退回我方半场，保留“接应者—球门”的遮挡关系。
+                distance = max(distance, length * (receive_pos.x() + margin)
+                               / (receive_pos.x() - anchor.x()))
+            b_pos = receive_pos + CppPackage.Polar2Vector(
+                distance, (anchor - receive_pos).dir())
+
+    # 门将在球到门中心的线上守位，横向限制在两门柱内。
+    # Goalie() 包含主动清球，死球阶段使用 SmartGoTo；活球后由 NormalPlay 接管。
+    goalie_y = ball.y() * margin / max(1, ball.x() - Positions.ourGoal.x())
+    post_limit = max(0, Params.goalWidth / 2 - margin)
+    g_pos = CGeoPoint(Positions.ourGoal.x() + margin,
+                      max(-post_limit, min(goalie_y, post_limit)))
+    flags = (Flags.dodge_ball | Flags.avoid_stop_ball_circle
+             | Flags.dodge_referee_area | Flags.allow_dss)
+    if kickoff:
+        flags |= Flags.avoid_half_field
+
+    tasks, occupied = {}, []
+    for role, target in (("G", g_pos), ("A", a_pos), ("B", b_pos)):
+        is_goalie = role == "G"
+        target = _legal_defend_pos(target, ball, kickoff,
+                                   goalie=is_goalie, occupied=occupied)
+        if target is None or (is_goalie and not Player.valid(Global.goalieNumber)):
+            skill = Skill.Stop()
+        else:
+            occupied.append(target)
+            if is_goalie:
+                # 使用普通移动技能时，也向底层登记固定门将身份。
+                CppPackage.TaskMediator.Instance().registerRole(Global.goalieNumber, "goalie")
+            role_flags = flags if is_goalie else flags | Flags.dodge_our_defense_box
+            skill = Skill.SmartGoTo(target, (ball - target).dir(), flag=role_flags)
+        if is_goalie:
+            # 标记实际下发目标；HOLD 表示门前各点均不合法或门将视觉丢失。
+            Global.debugEngine.gui_debug_msg(
+                target if target is not None else g_pos,
+                "G HOLD" if target is None or not Player.valid(Global.goalieNumber) else "G target")
+        tasks[role] = Task(skill, fixedNumber=Global.goalieNumber if is_goalie else -1)
+    return tasks
 
 
 class FreeKickDefendState(State):
-    """对方任意球时，两名场上队员挡住正面和一侧传球线路。"""
+    """A 封主罚者射门；B 贴近接应者，站在主罚者与接应者之间。"""
 
     def getTasks(self):
-        tasks = {"G": Task(Skill.Goalie())}
-
-        ball = Ball.pos()
-        side, middle, other_side, side2, other_side2 = Positions.refStopAroundBall()
-
-        # 只选场内、且不在两侧禁区附近的候选点。
-        def legal(point):
-            if abs(point.x()) > Params.pitchLength / 2 - 150:
-                return False
-            if abs(point.y()) > Params.pitchWidth / 2 - 150:
-                return False
-            if abs(point.y()) < Params.penaltyWidth / 2 + 200:
-                if point.x() < -Params.pitchLength / 2 + Params.penaltyDepth + 200:
-                    return False
-                if point.x() > Params.pitchLength / 2 - Params.penaltyDepth - 200:
-                    return False
-            return True
-
-        points = [p for p in (middle, side, other_side, side2, other_side2)
-                  if legal(p)]
-        flags = (Flags.dodge_ball | Flags.dodge_referee_area |
-                 Flags.dodge_our_defense_box)
-
-        for role, point in zip(("A", "B"), points):
-            tasks[role] = Task(
-                Skill.SmartGoTo(point, (ball - point).dir(), flag=flags)
-            )
-
-        for role in ("A", "B"):
-            if role not in tasks:
-                tasks[role] = Task(Skill.Stop())
-
-        return tasks
+        return _defend_tasks()
 
     def getMatchString(self):
+        # 本次定位球保持 A/B 分工，防止两车反复换人；目标仍每帧更新。
         return "(AB)"
 
     def transFunction(self):
@@ -206,6 +297,5 @@ class FreeKickDefendState(State):
 
 @declare_state_machine(FreeKickDefendState)
 class ExampleFreeKickDefend(StateMachine):
-    pass
-    """供裁判策略调度使用的我方任意球状态机。"""
+    """供裁判策略调度使用的对方任意球防守状态机。"""
 

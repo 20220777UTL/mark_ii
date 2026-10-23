@@ -1,34 +1,15 @@
-"""对方开球定位球策略：供 3V3 选手调用的查询、候选点与退出判断接口。
+"""3V3 对方开球防守：G 回门前，A 封主罚者射门，B 站在接应者与球门之间。
 
-文件末尾提供 ExampleKickOffDefend 单状态占位，供 Config.py 导入；
-可在 KickOffDefendState.getTasks() 填写任务，退出条件默认复用 play_switch()。
-
-3V3 共三辆车，包含一名门将和两名场上队员。选手自行编写开球等待、站位和
-退出逻辑。坐标、距离单位为毫米，使用视觉的我方坐标系，我方球门在负 X 方向。
-Left/Right 分别指负 Y / 正 Y 一侧，不代表摄像画面的左右。
-对手位置与合法移动目标是两回事，开球前尤其需要检查我方半场和中圈限制。
-所有接口在运行期间查询，不在模块导入时缓存视觉结果。
-
-建议思路：开球前两名场上队员在我方半场保护中路和可能的接球路线，
-门将守门；定位球流程完成后，由外层裁判调度决定是否进入常规比赛。左右查询和补防点
-都是可选参考，不要求为每个候选点都安排一辆车。
-play_switch 保留原开球防守的退出判断，选手可以根据自己的定位球策略增加结束条件。
-
-查询示例（放在运行期间执行的函数中）：
-    from Play.RefPlay.ExampleKickOffDefend import EnemyBestRobot, OTHER_POS
-    from Vision import Enemy
-    number = EnemyBestRobot()
-    opponent = Enemy.pos(number) if number >= 0 else None
-    candidate = OTHER_POS()  # 始终返回候选点，使用前再检查开球站位规则。
+复用任意球防守的内部站位函数，并增加我方半场和中圈限制。
+坐标、距离单位为毫米；我方球门在负 X 方向，Left/Right 指负 Y / 正 Y。
+保留模板原有查询接口；对手位置和参考点须经规则检查后才能作为移动目标。
 """
 
 from Geometry import CGeoPoint
 from Vision import Ball, Enemy
 from WorldModel import Conditions, Params
 from RoleMatch_LuaStyle import State, StateMachine, declare_state_machine
-from Play.Normal.ExampleNormalPlay import parameters as p
-from Play.Normal.ExampleNormalPlay import utils as u
-from Play.Normal.ExampleNormalPlay import skills as s
+from Play.RefPlay.ExampleFreeKickDefend import _defend_tasks
 
 
 __all__ = ["ExampleKickOffDefend", "Leftpos", "Rightpos", "OTHER_POS", "EnemyBestRobot", "play_switch"]
@@ -147,13 +128,14 @@ def play_switch():
 
 
 class KickOffDefendState(State):
-    """对方开球占位状态，在 getTasks 中填写具体防守任务。"""
+    """A 封主罚者射门；B 尽量贴近接应者，站位目标均留在我方半场。"""
 
     def getTasks(self):
-        return {}
+        return _defend_tasks(kickoff=True)
 
     def getMatchString(self):
-        return ""
+        # 固定本次定位球的两名场上角色，G 由共用任务固定为配置的门将车号。
+        return "(AB)"
 
     def transFunction(self):
         return play_switch()
@@ -161,5 +143,4 @@ class KickOffDefendState(State):
 
 @declare_state_machine(KickOffDefendState)
 class ExampleKickOffDefend(StateMachine):
-    pass
     """供裁判策略调度使用的对方开球状态机。"""
