@@ -59,6 +59,9 @@ from RoleMatch_LuaStyle import Task
 from RoleMatch_LuaStyle.Skills import Skill
 from WorldModel import Flags
 
+from Play.Normal.ExampleNormalPlay import utils as u
+from Play.Normal.ExampleNormalPlay import parameters as p
+
 __all__ = [
     "ExampleFreeKick",
     "getChipPower_DirectKick", "ReceivePos", "getFreeKickPos",
@@ -514,6 +517,8 @@ class FreeKickState(State):
         return ""
 
     def transFunction(self):
+        u.refreshHaveBallStatus()
+        u.OurLastHolder = self.playerNum("A")
         if self.receive_pos is None:
             return ""
 

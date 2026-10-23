@@ -225,7 +225,7 @@ class KickOffStates:
             return "(GAB)"
 
         def transFunction(self):
-            
+            u.refreshHaveBallStatus()
             Anum = self.playerNum("A")
             Bnum = self.playerNum("B")
             u.OurLastHolder = Bnum

@@ -13,7 +13,6 @@ from Vision import *
 from Vision import Enemy
 from WorldModel import Flags, Conditions, Params, Positions
 from RoleMatch_LuaStyle.Skills.Skill import *
-from Play.RefPlay.ExampleFreeKick import ReceivePos
 import random
 from CppPackage import InTheirPenaltyArea
 
@@ -24,7 +23,7 @@ class parameters:
     ENEMY_GOALIE = 0
     GOALIE_NUMBER = 0
     ARRIVAL_DIST = 150
-    ROBOT_MOUTH_RADIUS_MAX = 105 # mm 这个参数很重要！控制了KickOff脚本在多少的距离会从Rush转成PassToPos。
+    ROBOT_MOUTH_RADIUS_MAX = 125 # mm 这个参数很重要！控制了KickOff脚本在多少的距离会从Rush转成PassToPos。
     ROBOT_MOUTH_RADIUS_MIN = 90 # mm 没什么用的参数
     ROBOT_MOUTH_HALF_WIDTH = 30 # mm，这个是整个的宽度，但是在边缘处的情况下射球效果可能不理想
     ROBOT_RADIUS = 75 #mm
@@ -135,6 +134,13 @@ class utils:
         
         return statuses
     @staticmethod
+    def the_other_attacker(num: int):
+        ps = u.allPlayerStatus()
+        for i in ps:
+            if i != p.GOALIE_NUMBER and i != num:
+                return i
+        raise ValueError("The other attacker not found.")
+    @staticmethod
     def allEnemyStatus(): # 返回字典 {敌方车号i:车号i是否正在控球}
         players = [i for i in p.ALL_POSSIBLE_NUMBERS if Enemy.valid(i)] # 能否不实时更改？
         statuses = {}
@@ -218,6 +224,11 @@ class utils:
             P1, P2,
             start, end
         )
+    @staticmethod
+    def whetherBlockedByEnemy(start: CGeoPoint, end:CGeoPoint, enemyPos: CGeoPoint):
+        toEnemy = enemyPos - start
+        toEnd = end - start
+        return -math.pi/18 < (toEnd.dir() - toEnemy.dir()) < math.pi/18
 
     @staticmethod
     def sample_in_rectangle(
@@ -308,6 +319,13 @@ class utils:
                 return False
         return True
     @staticmethod
+    def available_path_simple(startpos: CGeoPoint, endpos: CGeoPoint) -> bool:
+        enemies = [i for i in p.ALL_POSSIBLE_NUMBERS if Enemy.valid(i)] # 能否不实时更改？
+        for enemy in enemies :
+            if u.whetherBlockedByEnemy(startpos, endpos, Enemy.pos(enemy)):
+                return False
+        return True
+    @staticmethod
     def centre_of_rectangle(rect: tuple[CGeoPoint, CGeoPoint] | tuple[CGeoPoint, CGeoPoint, CGeoPoint]):
         if rect.__len__() == 2:
             return CGeoPoint(
@@ -332,6 +350,8 @@ class skills:
 p = parameters
 u = utils
 s = skills
+
+from Play.RefPlay.ExampleFreeKick import ReceivePos
 
 class NormalStates :
     def __init__(self):
@@ -388,6 +408,8 @@ class NormalStates :
             self.Bnum = -1
             if u.OurLastHolder != -1 and u.JustKickedOff:
                 self.Anum = u.OurLastHolder
+                self.Bnum = u.the_other_attacker(u.OurLastHolder)
+                
 
 
         def run(self, isStateSwitched):
@@ -400,20 +422,21 @@ class NormalStates :
             # 记号约定：A负责接球，B负责传球或者直接打门。每次A接到球，刷新成select状态。
 
             # 选择点
+            debugEngine.gui_debug_msg(Ball.pos()+CVector(0,-200,), msgstr=f"OurLastholder={u.OurLastHolder}")
             if self.AttackingStatus == "select":
                 self.reset() # 清除固定车号，让官方munkres重新匹配。
                 
                 sample = None
                 for _ in range(p.MAX_ATTEMPTS):
                     sample = u.sample_in_rectangles(p.AREA_G)
-                    if u.available_path(Ball.pos(), sample, timeplus=0):
+                    if u.available_path_simple(Ball.pos(), sample):
                         self.NextPoint = sample
                         self.AttackingStatus = "shoot"
                         break
                 if self.AttackingStatus == "select": # 如果刚才没有选中说明不适合射门。看看能不能attack。
                     for _ in range(p.MAX_ATTEMPTS):
                         sample = u.sample_in_rectangles(p.AREA_K)
-                        if u.available_path(Ball.pos(), sample, timeplus=0):
+                        if u.available_path_simple(Ball.pos(), sample):
                             self.NextPoint = sample # 如果采样点中出现合适的进攻点位，就进行攻击。
                             self.AttackingStatus = "attack"
                             break
@@ -449,7 +472,8 @@ class NormalStates :
                 if self.NextPoint is None:
                     raise ValueError("Invalid Nexpoint.")
                 # 计算A的任务
-                if not self.Bpassed:
+                if self.Bpassed == False:
+                # if False:
                     Atask = Task(
                         SmartGoTo(
                             target=self.NextPoint, # 去往选择好的进攻点
@@ -459,23 +483,37 @@ class NormalStates :
                         fixedNumber=self.Anum
                     )
                 else: 
+                    if self.Anum != -1:
+                        debugEngine.gui_debug_msg(
+                            p=Player.pos(self.Anum),
+                            msgstr="going to ball!",
+                        )
                     Atask = Task(
-                        RushTo( # 动态拿球，下一步是射门或者传到下一个点
-                            pos = Ball.pos(),
-                            needDribble = True,
-                            angle = (u.centre_of_rectangle(p.AREA_K[0]) - self.NextPoint).dir(), #默认朝向射门区
-                        ),
+                        # RushTo( # 动态拿球，下一步是射门或者传到下一个点
+                        #     pos = Ball.pos(),
+                        #     needDribble = True,
+                        #     angle = (Ball.pos() - Player.pos(self.Anum)).dir(), #默认朝向射门区
+                        # ),
+                        GetBall(),
                         fixedNumber=self.Anum
                     )
                 # 计算B的任务
-                if not self.Bgotball:
-                    Btask = Task(
-                        PassToPos( # 传球给A
-                            pos = self.NextPoint,
-                            kickpower= 8000,
-                        ),
-                        fixedNumber=self.Bnum
-                    )
+                if not self.Bpassed:
+                    if self.Anum == -1:
+                        Btask = Task(
+                            StaticGetBallV4(
+                                pos = self.NextPoint,
+                                power=6000
+                            ),
+                            fixedNumber=self.Bnum
+                        )
+                    else:
+                        Btask = Task(
+                            StaticGetBallV4(
+                                pos = Player.pos(self.Anum),
+                                power=6000
+                            ), fixedNumber=self.Bnum
+                        )
                 else:
                     # B 接下来应该去哪里？
                     Bpoint = messiDecision.receiverPos()
@@ -500,11 +538,7 @@ class NormalStates :
                 Gtask = Task(Goalie(), fixedNumber=p.GOALIE_NUMBER)
 
 
-            debugEngine.gui_debug_msg(
-                p=p.DEBUG_MSG_POS,
-                msgstr=f"AttackingStatus={self.AttackingStatus}",
-                size = 150
-            )
+            
             if Atask is None:
                 Apoint = ReceivePos(shoot_pos=Enemy.pos(p.ENEMY_GOALIE))
                 Atask = Task(
@@ -513,6 +547,11 @@ class NormalStates :
                         dir = (Enemy.pos(p.ENEMY_GOALIE) - Apoint).dir()
                     ), fixedNumber=self.Anum
                 )
+            debugEngine.gui_debug_msg(
+                p=Ball.pos(),
+                msgstr=f"AttackingStatus={self.AttackingStatus}\nBgotball={self.Bgotball}\nBpassed={self.Bpassed}",
+                size = 150
+            )
             return {
                 "A": Atask,
                 "B": Btask,
@@ -523,7 +562,7 @@ class NormalStates :
             return "[BA](G)"
         def transFunction(self) -> str:
             u.refreshHaveBallStatus()
-            
+            u.JustKickedOff = False
             if not u.WeGotBall :# 进攻脚本一旦发现失去球权立即进入防守
                 return "Defend"
             if u.OurLastHolder == p.GOALIE_NUMBER:
@@ -531,7 +570,7 @@ class NormalStates :
 
             if not self.Bgotball and u.got_ball(self.Bnum):
                 self.Bgotball =  True
-            if self.Bgotball and not u.got_ball(self.Bnum):
+            if self.Bgotball and not u.arrive_at(Ball.pos(), self.Bnum, dist=250):
                 self.Bpassed = True
             
             self.Anum = self.playerNum("A") # 截取官方的任务分配结果，保持不变。
