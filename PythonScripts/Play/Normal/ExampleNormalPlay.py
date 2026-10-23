@@ -4,6 +4,7 @@ from typing import override
 import Global
 import Utils
 from Geometry import *
+import time
 from Global import debugEngine
 from RoleMatch_LuaStyle import Task, State, declare_state_machine, StateMachine
 from RoleMatch_LuaStyle.Skills import Skill, SimpleGoTo, Goalie, RushTo
@@ -29,13 +30,14 @@ class parameters:
     ROBOT_RADIUS = 75 #mm
     ROBOT_MAX_ACC = 1000 #mm/s^2
     LEAVE_THRESHOLD = 300 # 用来判断是否已经出球
-    KICK_OFF_RESIDUAL_VEL = 200 # 用来避免Double Touch的，控制的到达踢球点时与球的相对速度。
+    KICK_OFF_RESIDUAL_VEL = 500 # 用来避免Double Touch的，控制的到达踢球点时与球的相对速度。
     DEFAULT_POS = CGeoPoint(3000, 3000)
     ALL_POSSIBLE_NUMBERS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     DEBUG_MSG_POS = CGeoPoint(0, -4000)
     DEFAULT_PASS_MAX_BALL_VELOCITY = 3500
     DPMBV = DEFAULT_PASS_MAX_BALL_VELOCITY
     GOAL_WIDTH = 1000
+    TOUCH_BALL_ACC_THRESHOLD = 1000 # 超过这个阈值，就代表球发生了剧烈的加速，意味着有人触球。
     MAX_ATTEMPTS = 8 # 每一个进攻阶段会在每个候选区域内进行这么多次采样尝试，如果采样失败就返回到更保守的候选区域。
     AREA_J = [
         (CGeoPoint(3000, -1200), CGeoPoint(4200, -2700)), # 右下角的传球区
@@ -51,7 +53,13 @@ class parameters:
 """PARAMETERS ABOVE"""
 """UTIL FUNCTIONS BELOW"""
 class utils:
+    ShouldReceiver = 0
+    ShouldPasser = 1
+    LastRefreshTime : float = 0
+    LastBallVel : CVector = CVector(0, 0)
+    BallAcc: CVector = CVector(0, 0)
     WeGotBall : bool = False
+    LastBallToucher: tuple
     # We Got Ball 的定义：
     # 如果发生暂停，WeGotBall为False。
     # 如果当前在活球状态，那么已经开球，一定存在上一个持球者。上一个持球者如果不是我方球员，WeGotBall=False。
@@ -78,7 +86,7 @@ class utils:
             return None
         return (vect[0] / len, vect[1] / len)
     @staticmethod
-    def kick_ball_pos(ballpos: CGeoPoint, target: CGeoPoint, prep_length: float = 100):
+    def kick_ball_pos(ballpos: CGeoPoint, target: CGeoPoint, prep_length: float = parameters.ROBOT_MOUTH_RADIUS_MIN):
         """返回 (出球朝向, 准备位置)：沿球指向 target 的反方向后退 prep_length。
 
         prep_length 单位为 mm；准备位置是机器人中心的目标点。
@@ -100,10 +108,12 @@ class utils:
         if not isEnemy:
             rx = Ball.posX() - Player.posX(role)
             ry = Ball.posY() - Player.posY(role)
+            angle = Player.direction(role)
         else:
             rx = Ball.posX() - Enemy.posX(role)
             ry = Ball.posY() - Enemy.posY(role)
-        angle = Player.direction(role)
+            angle = Enemy.dir(role)
+        
         dir = (math.cos(angle), math.sin(angle)) # 机器人方向向量
         norm = (-dir[1], dir[0]) # 机器人法向量
         para = u.dot2(dir, (rx, ry)) # 机器人朝向方向，球在哪个位置
@@ -150,6 +160,7 @@ class utils:
     @classmethod
     def refreshHaveBallStatus(cls): # 必须每个State的transFunction都反复调用，否则就没用。实时刷新才能用！
         # 当前实现中会在NormalPlay的每个时刻都调取。
+        
         ps = cls.allPlayerStatus()
         for i in ps:
             if ps[i] == True:
@@ -162,6 +173,33 @@ class utils:
                 cls.OurLastHolder = -1
             if InTheirPenaltyArea(Enemy.pos(i), 0):
                 p.ENEMY_GOALIE = i
+
+        if u.LastRefreshTime != 0: # 不是第一次
+            u.BallAcc = (Ball.vel() - u.LastBallVel)/(time.monotonic() - u.LastRefreshTime)
+            u.LastBallVel = Ball.vel()
+            u.LastRefreshTime = time.monotonic()
+            if u.BallAcc.mod() > p.TOUCH_BALL_ACC_THRESHOLD:
+                o = []
+                
+                for i in ps:
+                    o.append((i, (Ball.pos() - Player.pos(i)).mod(), False))
+                for j in es:
+                    o.append((j, (Ball.pos() - Enemy.pos(j)).mod(), True))
+                mini = (0, float("inf"), False)
+                for t in o:
+                    if t[1] < mini[1]:
+                        mini = t
+                u.LastBallToucher = mini
+                
+                
+        else:
+            u.LastBallVel = Ball.vel()
+            u.LastRefreshTime = time.monotonic()
+
+        
+                
+
+        
 
         
     @staticmethod
@@ -372,10 +410,9 @@ class NormalStates :
             return ""
     class Defend(State):
         def getTasks(self):
-            # TODO : WMarking 如何做到让两个车都去防守？现在只有一个车在防守，Goalie和B都呆在那里。
             return {
                 "A": Task(WMarking(priority=0)),
-                "B": Task(WMarking(priority=0)),
+                "B": Task(WMarking(priority=1)),
                 "G": Task(Goalie(), fixedNumber=p.GOALIE_NUMBER)
             }
         def getMatchString(self) -> str:
@@ -388,25 +425,34 @@ class NormalStates :
             return ""
     class AttackFromGoalie(State):
         def getTasks(self):
+            receive_pos = u.sample_in_rectangles(p.AREA_J)
+            attack_pos = u.sample_in_rectangles(p.AREA_K)
+
+            
             return {
-                "G": Task(Goalie(), fixedNumber=p.GOALIE_NUMBER)
+                "A": Task(SmartGoTo(target=receive_pos, dir = (Ball.pos() - receive_pos).dir(), flag=Flags.quickly)),
+                "B": Task(SmartGoTo(target=attack_pos, dir=(Ball.pos() - attack_pos).dir(), flag = Flags.quickly)),
+                "G": Task(StaticGetBallV4(pos = receive_pos, isChip=True), fixedNumber=p.GOALIE_NUMBER)
             }
         def getMatchString(self) -> str:
-            return ""
+            return "(ABG)"
         def transFunction(self) -> str:
             u.refreshHaveBallStatus()
+            u.ShouldPasser = self.playerNum("A")
+            u.ShouldReceiver = self.playerNum("B")
             if not u.WeGotBall :# 进攻脚本一旦发现失去球权立即进入防守
                 return "Defend"
+            if not u.arrive_at(Ball.pos(), p.GOALIE_NUMBER, dist = 300):
+                return "AttackNormal"
             return ""
     class AttackNormal(State):
         def reset(self):
             self.AttackingStatus = "select"
             self.NextPoint = None
-            self.Bgotball = False
-            self.Bpassed = False
+            self.Bstatus = "getball" # getball shoot pass
             self.Anum = -1
             self.Bnum = -1
-            if u.OurLastHolder != -1 and u.JustKickedOff:
+            if u.JustKickedOff:
                 self.Anum = u.OurLastHolder
                 self.Bnum = u.the_other_attacker(u.OurLastHolder)
                 
@@ -422,10 +468,11 @@ class NormalStates :
             # 记号约定：A负责接球，B负责传球或者直接打门。每次A接到球，刷新成select状态。
 
             # 选择点
-            debugEngine.gui_debug_msg(Ball.pos()+CVector(0,-200,), msgstr=f"OurLastholder={u.OurLastHolder}")
-            if self.AttackingStatus == "select":
-                self.reset() # 清除固定车号，让官方munkres重新匹配。
-                
+            debugEngine.gui_debug_msg(Ball.pos()+CVector(0,-200), msgstr=f"OurLastholder={u.OurLastHolder} JustKickedOff={u.JustKickedOff}")
+            if self.AttackingStatus == "select": # select状态表示接下来判断下一个进攻路线
+                 # 清除固定车号，让官方munkres重新匹配。
+                self.NextPoint = None
+                self.Bstatus = "getball" # getball dribble shoot
                 sample = None
                 for _ in range(p.MAX_ATTEMPTS):
                     sample = u.sample_in_rectangles(p.AREA_G)
@@ -440,65 +487,41 @@ class NormalStates :
                             self.NextPoint = sample # 如果采样点中出现合适的进攻点位，就进行攻击。
                             self.AttackingStatus = "attack"
                             break
-                if self.NextPoint is None: # 否则回传
-                    self.AttackingStatus = "goback"
+                
 
             #根据采样结果规划下一步的任务
-            if self.AttackingStatus == "goback" : # 如果采样失败，准备回传并重新传出。
-                Apoint = u.sample_in_rectangle(*p.AREA_J[0]) # 进攻传球队员的准备点位
-                Atask = Task(
-                    SmartGoTo(
-                        target=Apoint,
-                        dir=(Player.pos(p.GOALIE_NUMBER) - Apoint).dir(),
-                        flag=Flags.quickly
-                    ),
-                    fixedNumber=self.Anum
-                )
-                Btask = Task(
-                    PassToPos(
-                        Player.pos(p.GOALIE_NUMBER),
-                        kickpower=7000
-                    ),
-                    fixedNumber=self.Bnum
-                )
-                Gtask = Task(
-                    StaticGetBallV4(
-                        pos=Apoint,
-                        power=11000,
-                        isChip=True
-                    ), fixedNumber=p.GOALIE_NUMBER
-                )
-            elif self.AttackingStatus == "attack":
+            if self.AttackingStatus == "attack":
                 if self.NextPoint is None:
                     raise ValueError("Invalid Nexpoint.")
                 # 计算A的任务
-                if self.Bpassed == False:
-                # if False:
+                
+                if self.Bstatus != "end":
                     Atask = Task(
                         SmartGoTo(
-                            target=self.NextPoint, # 去往选择好的进攻点
+                            # target=self.NextPoint, # 去往选择好的进攻点
+                            target=self.NextPoint, # 实时跑位
                             dir=(u.centre_of_rectangle(p.AREA_K[0]) - self.NextPoint).dir(), #朝向射门区K
                             flag = Flags.quickly
                         ),
                         fixedNumber=self.Anum
                     )
+                    debugEngine.gui_debug_msg(p=Player.pos(self.Anum)+CVector(0,-150), msgstr="A:SmartGoto(NextPoint)")
                 else: 
                     if self.Anum != -1:
                         debugEngine.gui_debug_msg(
                             p=Player.pos(self.Anum),
                             msgstr="going to ball!",
                         )
+                    
                     Atask = Task(
-                        # RushTo( # 动态拿球，下一步是射门或者传到下一个点
-                        #     pos = Ball.pos(),
-                        #     needDribble = True,
-                        #     angle = (Ball.pos() - Player.pos(self.Anum)).dir(), #默认朝向射门区
-                        # ),
-                        GetBall(),
+                        RushTo(
+                            Apoint, angle = (Ball.pos() - Apoint).dir(), needDribble=True
+                        ),
                         fixedNumber=self.Anum
                     )
+                    debugEngine.gui_debug_msg(p=Player.pos(self.Anum)+CVector(0,-150), msgstr="A:GetBall()")
                 # 计算B的任务
-                if not self.Bpassed:
+                if self.Bstatus == "getball":
                     if self.Anum == -1:
                         Btask = Task(
                             StaticGetBallV4(
@@ -507,13 +530,39 @@ class NormalStates :
                             ),
                             fixedNumber=self.Bnum
                         )
+                        debugEngine.gui_debug_msg(p=Player.pos(self.Bnum)+CVector(0,-150), msgstr="B:StaticGetBallV4(NextPoint,6000)")
                     else:
                         Btask = Task(
                             StaticGetBallV4(
                                 pos = Player.pos(self.Anum),
                                 power=6000
-                            ), fixedNumber=self.Bnum
+                            ),
+                            fixedNumber=self.Bnum
                         )
+                        debugEngine.gui_debug_msg(p=Player.pos(self.Bnum)+CVector(0,-150), msgstr="B:getball:StaticGetBallV4(Apos,6000)")
+                elif self.Bstatus == "dribble":
+                    Bangle, Bpos = u.kick_ball_pos(Ball.pos(), Player.pos(self.Anum), prep_length=p.ROBOT_MOUTH_RADIUS_MIN - 60)
+                    Btask = Task(
+                        # RushTo(
+                        #     Bpos, Bangle, needDribble=True, flag=Flags.quickly,
+                        #     vel=(Player.pos(self.Anum) - Ball.pos()).unit()*p.KICK_OFF_RESIDUAL_VEL
+                        # ),
+                        SimpleGoTo(
+                            Bpos, Bangle
+                        ),
+                        fixedNumber=self.Bnum
+                    )
+                    debugEngine.gui_debug_msg(p=Player.pos(self.Bnum)+CVector(0,-150), msgstr="B:dribble:RushTo")
+
+                elif self.Bstatus == "shoot":
+                    Btask = Task(
+                        TurnAndShoot(
+                            target = Player.pos(self.Anum), power = 6000
+                        ),
+                        fixedNumber=self.Bnum
+                    )
+                    debugEngine.gui_debug_msg(p=Player.pos(self.Bnum)+CVector(0,-150), msgstr="B:TurnAndShoot(Apos,6000)")
+                        
                 else:
                     # B 接下来应该去哪里？
                     Bpoint = messiDecision.receiverPos()
@@ -525,6 +574,7 @@ class NormalStates :
                         ),
                         fixedNumber=self.Bnum
                     )
+                    debugEngine.gui_debug_msg(p=Player.pos(self.Bnum)+CVector(0,-150), msgstr="B:SmartGoTo(messiDecision)")
                 Gtask = Task(
                     Goalie(),
                     fixedNumber=p.GOALIE_NUMBER
@@ -535,6 +585,7 @@ class NormalStates :
                     NormalShoot(power = 11000, isChip=False, flag=Flags.do_not_stop),
                     fixedNumber=self.Bnum
                 )
+                debugEngine.gui_debug_msg(p=Player.pos(self.Bnum)+CVector(0,-150), msgstr="B:NormalShoot(11000)")
                 Gtask = Task(Goalie(), fixedNumber=p.GOALIE_NUMBER)
 
 
@@ -547,9 +598,10 @@ class NormalStates :
                         dir = (Enemy.pos(p.ENEMY_GOALIE) - Apoint).dir()
                     ), fixedNumber=self.Anum
                 )
+                debugEngine.gui_debug_msg(p=Player.pos(self.Anum)+CVector(0,-150), msgstr="A:SmartGoTo(Apoint)")
             debugEngine.gui_debug_msg(
-                p=Ball.pos(),
-                msgstr=f"AttackingStatus={self.AttackingStatus}\nBgotball={self.Bgotball}\nBpassed={self.Bpassed}",
+                p=CGeoPoint(0,4800),
+                msgstr=f"AttackingStatus={self.AttackingStatus}  Bstatus:{self.Bstatus}",
                 size = 150
             )
             return {
@@ -558,25 +610,44 @@ class NormalStates :
                 "G": Gtask
             }
             
+        # def getTasks(self):
+        #     Atask = Task(SimpleGoTo(CGeoPoint(-3000,1000)), fixedNumber=self.Anum)
+        #     Btask = Task(SimpleGoTo(CGeoPoint(3000,1000)), fixedNumber=self.Bnum)
+        #     return{
+        #         "A":Atask,
+        #         "B":Btask,
+        #         "G":Task(Goalie())
+        #     }
+
         def getMatchString(self) -> str:
             return "[BA](G)"
         def transFunction(self) -> str:
             u.refreshHaveBallStatus()
-            u.JustKickedOff = False
             if not u.WeGotBall :# 进攻脚本一旦发现失去球权立即进入防守
                 return "Defend"
             if u.OurLastHolder == p.GOALIE_NUMBER:
                 return "AttackFromGoalie"
 
-            if not self.Bgotball and u.got_ball(self.Bnum):
-                self.Bgotball =  True
-            if self.Bgotball and not u.arrive_at(Ball.pos(), self.Bnum, dist=250):
-                self.Bpassed = True
+            # if not self.Bgotball and u.got_ball(self.Bnum):
+            #     self.Bgotball =  True
+            # if self.Bgotball and not u.arrive_at(Ball.pos(), self.Bnum, dist=250):
+            #     self.Bpassed = True
+            if self.Bstatus == "getball":
+                if u.arrive_at(Ball.pos(), self.Bnum, dist=500):
+                    self.Bstatus = "dribble"
+            elif self.Bstatus == "dribble":
+                if u.got_ball(self.Bnum):
+                    self.Bstatus = "shoot"
+            elif self.Bstatus == "shoot":
+                if (Ball.pos() - Player.pos(self.Anum)).mod() < (Ball.pos() - Player.pos(self.Bnum)).mod():
+                    self.Bstatus = "end" # 如果距离A更近才切换到end
+            
             
             self.Anum = self.playerNum("A") # 截取官方的任务分配结果，保持不变。
             self.Bnum = self.playerNum("B")
 
-            if u.got_ball(self.Anum):# A方接到球就进行下一次选择，各种参数重置由getTasks进行。
+            if u.arrive_at(Ball.pos(), self.Anum, dist=250):# A方接到球就进行下一次选择，各种参数重置由getTasks进行。
+                u.JustKickedOff = False
                 self.AttackingStatus = "select"
             
             return ""

@@ -191,7 +191,7 @@ class KickOffStates:
         def getTasks(self):
             self.ballpos = Ball.pos()
             self.kick_off_prep_pos = KickOffStates.kick_off_prep_pos
-            self.kick_off_angle, self.kick_off_pos = u.kick_ball_pos(self.ballpos, self.kick_off_prep_pos, prep_length=p.ROBOT_MOUTH_RADIUS_MIN - 40)
+            self.kick_off_angle, self.kick_off_pos = u.kick_ball_pos(self.ballpos, self.kick_off_prep_pos, prep_length=p.ROBOT_MOUTH_RADIUS_MIN - 100)
             self.residual_vel = u.toVector(p.KICK_OFF_RESIDUAL_VEL, self.kick_off_angle)
 
             if not self.Bpassed:

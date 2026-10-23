@@ -15,6 +15,10 @@ from WorldModel import Conditions, Params, Positions, Flags
 from RoleMatch_LuaStyle import State, StateMachine, Task, declare_state_machine
 from RoleMatch_LuaStyle.Skills import Skill
 from Play.RefPlay.OfficialSupport import disable_ball_actions, stop_tasks
+from Play.Normal.ExampleNormalPlay import parameters as p
+from Play.Normal.ExampleNormalPlay import utils as u
+from Play.Normal.ExampleNormalPlay import skills as s
+from Global import debugEngine
 
 
 __all__ = ["ExampleFreeKickDefend", "getAttackerNum", "getFreeKickDefPos", "EnemyBestRobot", "nearest1", "play_switch"]
@@ -285,6 +289,8 @@ class FreeKickDefendState(State):
     """A 封主罚者射门；B 贴近接应者，站在主罚者与接应者之间。"""
 
     def getTasks(self):
+        u.WeGotBall = False
+        u.OurLastHolder = -1
         return _defend_tasks()
 
     def getMatchString(self):
@@ -292,6 +298,7 @@ class FreeKickDefendState(State):
         return "(AB)"
 
     def transFunction(self):
+        
         return play_switch()
 
 

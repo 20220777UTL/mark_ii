@@ -10,7 +10,10 @@ from Vision import Ball, Enemy
 from WorldModel import Conditions, Params
 from RoleMatch_LuaStyle import State, StateMachine, declare_state_machine
 from Play.RefPlay.ExampleFreeKickDefend import _defend_tasks
-
+from Play.Normal.ExampleNormalPlay import parameters as p
+from Play.Normal.ExampleNormalPlay import utils as u
+from Play.Normal.ExampleNormalPlay import skills as s
+from Global import debugEngine
 
 __all__ = ["ExampleKickOffDefend", "Leftpos", "Rightpos", "OTHER_POS", "EnemyBestRobot", "play_switch"]
 
@@ -131,6 +134,8 @@ class KickOffDefendState(State):
     """A 封主罚者射门；B 尽量贴近接应者，站位目标均留在我方半场。"""
 
     def getTasks(self):
+        u.WeGotBall = False
+        u.OurLastHolder = -1
         return _defend_tasks(kickoff=True)
 
     def getMatchString(self):
