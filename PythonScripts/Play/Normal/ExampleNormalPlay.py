@@ -452,9 +452,7 @@ class NormalStates :
             self.Bstatus = "getball" # getball shoot pass
             self.Anum = -1
             self.Bnum = -1
-            if u.JustKickedOff:
-                self.Anum = u.OurLastHolder
-                self.Bnum = u.the_other_attacker(u.OurLastHolder)
+            
                 
 
 
@@ -466,7 +464,9 @@ class NormalStates :
         def getTasks(self):
             # 对下一个进攻点进行采样——我的方法。
             # 记号约定：A负责接球，B负责传球或者直接打门。每次A接到球，刷新成select状态。
-
+            if u.JustKickedOff:
+                self.Anum = u.OurLastHolder
+                self.Bnum = u.the_other_attacker(u.OurLastHolder)
             # 选择点
             debugEngine.gui_debug_msg(Ball.pos()+CVector(0,-200), msgstr=f"OurLastholder={u.OurLastHolder} JustKickedOff={u.JustKickedOff}")
             if self.AttackingStatus == "select": # select状态表示接下来判断下一个进攻路线
@@ -514,8 +514,8 @@ class NormalStates :
                         )
                     
                     Atask = Task(
-                        RushTo(
-                            Apoint, angle = (Ball.pos() - Apoint).dir(), needDribble=True
+                        GetBallV5(
+                            direction = (Player.pos(self.Bnum)-Player.pos(self.Anum)).dir()
                         ),
                         fixedNumber=self.Anum
                     )
@@ -543,13 +543,12 @@ class NormalStates :
                 elif self.Bstatus == "dribble":
                     Bangle, Bpos = u.kick_ball_pos(Ball.pos(), Player.pos(self.Anum), prep_length=p.ROBOT_MOUTH_RADIUS_MIN - 60)
                     Btask = Task(
-                        # RushTo(
-                        #     Bpos, Bangle, needDribble=True, flag=Flags.quickly,
-                        #     vel=(Player.pos(self.Anum) - Ball.pos()).unit()*p.KICK_OFF_RESIDUAL_VEL
-                        # ),
-                        SimpleGoTo(
-                            Bpos, Bangle
+                        GetBallV5(
+                            direction=(Player.pos(self.Anum)-Player.pos(self.Bnum)).dir()
                         ),
+                        # SimpleGoTo(
+                        #     Bpos, Bangle
+                        # ),
                         fixedNumber=self.Bnum
                     )
                     debugEngine.gui_debug_msg(p=Player.pos(self.Bnum)+CVector(0,-150), msgstr="B:dribble:RushTo")
