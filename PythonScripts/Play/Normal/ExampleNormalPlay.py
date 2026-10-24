@@ -150,7 +150,7 @@ class utils:
         for i in ps:
             if i != p.GOALIE_NUMBER and i != num:
                 return i
-        raise ValueError("The other attacker not found.")
+        return -1
     @staticmethod
     def allEnemyStatus(): # 返回字典 {敌方车号i:车号i是否正在控球}
         players = [i for i in p.ALL_POSSIBLE_NUMBERS if Enemy.valid(i)] # 能否不实时更改？
@@ -410,18 +410,175 @@ class NormalStates :
                 return "AttackNormal"
             
     class Defend(State):
+        INTERCEPT_OFFSET = 100       # mm，球背向持球对手一侧
+        MARK_OFFSET = 200            # mm，另一对手朝球方向
+        TEAMMATE_CLEARANCE = 2 * p.ROBOT_RADIUS + 60
+        APPROACH_TOLERANCE = 60      # mm，到拦截点后开始断球
+        CLEAR_POWER = 6000
+
+        def run(self, isStateSwitched):
+            if isStateSwitched or not hasattr(self, "enemy_for_role"):
+                self.enemy_for_role = {"A": None, "B": None}
+                self.defender_for_role = {"A": -1, "B": -1}
+            return super().run(isStateSwitched)
+
+        @staticmethod
+        def _point_towards(start, target, distance):
+            dx, dy = target.x() - start.x(), target.y() - start.y()
+            length = math.hypot(dx, dy)
+            if length < 1:
+                dx, dy = Positions.ourGoal.x() - start.x(), Positions.ourGoal.y() - start.y()
+                length = math.hypot(dx, dy)
+                if length < 1:
+                    dx, dy, length = 1, 0, 1
+            return CGeoPoint(start.x() + distance * dx / length,
+                             start.y() + distance * dy / length)
+
+        @staticmethod
+        def _legal_target(point):
+            from CppPackage import MakeInField, InOurPenaltyArea, MakeOutOfOurPenaltyArea
+            margin = p.ROBOT_RADIUS + 30
+            point = MakeInField(point, margin)
+            if InOurPenaltyArea(point, margin):
+                point = MakeOutOfOurPenaltyArea(point, margin + 1)
+                point = MakeInField(point, margin)
+            return point
+
+        @classmethod
+        def _separate_target(cls, target, occupied):
+            """目标不能与队友的当前位置或另一目标重叠；无安全点时停止。"""
+            target = cls._legal_target(target)
+            occupied = [point for point in occupied if point is not None]
+            if all(target.dist(point) >= cls.TEAMMATE_CLEARANCE for point in occupied):
+                return target
+            for point in occupied:
+                dx, dy = target.x() - point.x(), target.y() - point.y()
+                length = math.hypot(dx, dy)
+                if length < 1:
+                    dx, dy, length = 0, 1, 1
+                ux, uy = dx / length, dy / length
+                for vx, vy in ((ux, uy), (-uy, ux), (uy, -ux)):
+                    candidate = cls._legal_target(CGeoPoint(
+                        point.x() + vx * cls.TEAMMATE_CLEARANCE,
+                        point.y() + vy * cls.TEAMMATE_CLEARANCE))
+                    if all(candidate.dist(other) >= cls.TEAMMATE_CLEARANCE - 5
+                           for other in occupied):
+                        return candidate
+            return None
+
+        def _attackers(self):
+            # 3V3：排除留在其本方禁区的门将。门将出击时按离我方球门
+            # 的距离选最有威胁的两人，不把对方车号 0 固定当门将。
+            candidates = [number for number in p.ALL_POSSIBLE_NUMBERS
+                          if Enemy.valid(number)
+                          and not InTheirPenaltyArea(Enemy.pos(number), 0)]
+            incumbents = [self.enemy_for_role[role] for role in ("A", "B")
+                          if self.enemy_for_role[role] in candidates]
+            candidates.sort(key=lambda number:
+                            (Enemy.pos(number).dist(Positions.ourGoal), number))
+            return (incumbents + [n for n in candidates if n not in incumbents])[:2]
+
+        def _remember_attackers(self, attackers):
+            # 同一 Defend 生命周期内，存活的对手始终由同一个角色盯防。
+            for role in ("A", "B"):
+                if self.enemy_for_role[role] not in attackers:
+                    self.enemy_for_role[role] = None
+            for enemy in attackers:
+                if enemy not in self.enemy_for_role.values():
+                    role = next((name for name in ("A", "B")
+                                 if self.enemy_for_role[name] is None), None)
+                    if role is not None:
+                        self.enemy_for_role[role] = enemy
+
+        @staticmethod
+        def _get_ball_task(ball):
+            return Task(GetBallV5(
+                direction=(Positions.theirGoal - ball).dir(),
+                flag=Flags.allow_dss | Flags.dodge_our_defense_box))
+
+        @staticmethod
+        def _move_task(target, ball):
+            if target is None:
+                return Task(Stop())
+            return Task(SmartGoTo(
+                target=target, dir=(ball - target).dir(),
+                flag=Flags.quickly | Flags.allow_dss | Flags.dodge_our_defense_box))
+
+        def _defender_position(self, role):
+            number = self.defender_for_role.get(role, -1)
+            return Player.pos(number) if number >= 0 and Player.valid(number) else None
+
+        def _intercept(self, role, enemy, ball, other_role):
+            enemy_pos = Enemy.pos(enemy)
+            # 从对手经球继续向外延伸 100 mm；重合时退向我方球门。
+            outward = (ball + (ball - enemy_pos)) if ball.dist(enemy_pos) >= 1 else Positions.ourGoal
+            target = self._point_towards(ball, outward, self.INTERCEPT_OFFSET)
+            target = self._separate_target(target, [self._defender_position(other_role)])
+            if target is None:
+                return Task(Stop()), None
+            defender_pos = self._defender_position(role)
+            if (defender_pos is not None
+                    and defender_pos.dist(target) <= self.APPROACH_TOLERANCE):
+                return Task(StaticGetBallV4(
+                    pos=Positions.theirGoal, power=self.CLEAR_POWER, isChip=True,
+                    flag=Flags.allow_dss | Flags.dodge_our_defense_box)), target
+            return self._move_task(target, ball), target
+
         def getTasks(self):
-            return {
-                "A": Task(WMarking(priority=0)),
-                "B": Task(WMarking(priority=1)),
-                "G": Task(Goalie(), fixedNumber=p.GOALIE_NUMBER)
-            }
+            tasks = {"G": Task(Goalie(), fixedNumber=p.GOALIE_NUMBER)}
+            if not Ball.valid():
+                tasks.update({"A": Task(Stop()), "B": Task(Stop())})
+                return tasks
+
+            ball = Ball.pos()
+            attackers = self._attackers()
+            self._remember_attackers(attackers)
+            holders = [enemy for enemy in attackers if u.got_ball(enemy, True)]
+            holder = min(holders, key=lambda enemy: (Enemy.pos(enemy).dist(ball), enemy),
+                         default=None)
+
+            if not attackers:
+                tasks["A"] = self._get_ball_task(ball)
+                block = self._point_towards(ball, Positions.ourGoal, 550)
+                tasks["B"] = self._move_task(self._legal_target(block), ball)
+            elif len(attackers) == 1:
+                enemy = attackers[0]
+                chaser = next(role for role in ("A", "B")
+                              if self.enemy_for_role[role] == enemy)
+                blocker = "B" if chaser == "A" else "A"
+                tasks[chaser] = self._get_ball_task(ball)
+                intercept_target = ball
+                block = self._point_towards(ball, Positions.ourGoal, 550)
+                block = self._separate_target(
+                    block, [intercept_target, self._defender_position(chaser)])
+                tasks[blocker] = self._move_task(block, ball)
+            elif holder is None:
+                tasks["A"] = self._get_ball_task(ball)
+                tasks["B"] = self._get_ball_task(ball)
+            else:
+                chaser = next(role for role in ("A", "B")
+                              if self.enemy_for_role[role] == holder)
+                blocker = "B" if chaser == "A" else "A"
+                tasks[chaser], intercept_target = self._intercept(
+                    chaser, holder, ball, blocker)
+                other_enemy = self.enemy_for_role[blocker]
+                guard = self._point_towards(
+                    Enemy.pos(other_enemy), ball, self.MARK_OFFSET)
+                guard = self._separate_target(
+                    guard, [intercept_target, self._defender_position(chaser)])
+                tasks[blocker] = self._move_task(guard, ball)
+            return tasks
+
         def getMatchString(self) -> str:
-            return "[AB](G)"
+            # 首帧匹配一次；后续保持 A/B 两辆实际车号与盯防目标不变。
+            return "(AB)(G)"
+
         def transFunction(self) -> str:
             u.refreshHaveBallStatus()
-            if u.WeGotBall : # 防守脚本一旦抢到球获得球权就进入进攻脚本。
-                # TODO : 需要特殊处理双方抢球的情况
+            self.defender_for_role = {role: self.playerNum(role)
+                                      for role in ("A", "B")}
+            if u.WeGotBall and any(
+                    u.got_ball(number) for number in Player.getAllValidNumbers()):
                 return "StartAttack"
             return ""
     class AttackFromGoalie(State):
@@ -525,9 +682,8 @@ class NormalStates :
                 if self.Bstatus == "getball":
                     if self.Anum == -1:
                         Btask = Task(
-                            StaticGetBallV4(
-                                pos = self.NextPoint,
-                                power=6000
+                            GetBallV5(
+                                direction=(Player.pos(self.Anum) - Player.pos(self.Bnum)).dir()
                             ),
                             fixedNumber=self.Bnum
                         )
@@ -664,6 +820,7 @@ class NormalStates :
             if u.arrive_at(Ball.pos(), self.Anum, dist=250):# A方接到球就进行下一次选择，各种参数重置由getTasks进行。
                 u.JustKickedOff = False
                 self.AttackingStatus = "select"
+
             
             return ""
     class AttackDispicable(State):

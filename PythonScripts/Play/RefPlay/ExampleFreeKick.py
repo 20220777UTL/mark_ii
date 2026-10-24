@@ -548,6 +548,6 @@ class ExampleFreeKick(StateMachine):
     pass
     """供裁判策略调度使用的我方任意球状态机。"""
 
-    def hookBeforePlanTasks(self):
-        # 由上面的 play_switch() 通知框架本次任意球结束。
-        Global.hasFinishedRefPlay = False
+    # def hookBeforePlanTasks(self):
+    #     # 由上面的 play_switch() 通知框架本次任意球结束。
+    #     Global.hasFinishedRefPlay = False

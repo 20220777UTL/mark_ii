@@ -6,6 +6,7 @@ skill_cpp(executor) 为实际车号下发任务；matchPos(executor) 提供角�
 # Goalie uses fdb37bdc (2025-10-18), with an optional clearing target.
 # PassToPos uses ChaseKickV1 and refreshes its target, direction, and power each frame.
 # WMarking uses the native marking skill and its target query for role matching.
+import math
 import typing
 # from numbers import Number
 from typing import Any
@@ -277,6 +278,58 @@ def TurnAndShoot(target: CGeoPoint = Positions.theirGoal, registerRole="leader",
         return CppPackage.WeBestGetBallPosition(executor)
 
     return skill_cpp, matchPos
+
+def OrbitBallToDirection(direction: typing.Union[typing.SupportsFloat, typing.Callable[[int], typing.SupportsFloat]],
+                         *, radius: float = 170, max_step: float = math.pi / 6,
+                         flag: int = Flags.quickly | Flags.allow_dss):
+    """绕球到适合沿 direction 出球的站位；角度为弧度，+X 为 0，逆时针为正。
+
+    每帧根据视觉球位更新圆弧目标，走归一化角差较短的一侧。机器人始终朝球；
+    距球过近或过远时先回到圆周。这里只移动和转向，不依赖吸球，也不踢球。
+    direction 可以是弧度值，或接收执行车号、返回弧度的函数。
+    """
+    radius = float(radius)
+    max_step = float(max_step)
+    if not math.isfinite(radius) or radius < Params.playerRadius + 60:
+        raise ValueError("radius 必须至少比机器人半径大 60 mm")
+    if not math.isfinite(max_step) or not 0 < max_step <= math.pi / 3:
+        raise ValueError("max_step 必须在 (0, pi/3] 弧度内")
+
+    def skill_cpp(executor: int) -> Any:
+        if not Ball.valid() or not Player.valid(executor):
+            return CppPackage.makeItStop(executor)
+
+        requested = direction(executor) if callable(direction) else direction
+        requested = float(requested)
+        if not math.isfinite(requested):
+            raise ValueError("direction 必须是有限弧度值")
+        target_angle = math.atan2(math.sin(requested), math.cos(requested))
+        ball_pos, player_pos = Ball.pos(), Player.pos(executor)
+        dx, dy = player_pos.x() - ball_pos.x(), player_pos.y() - ball_pos.y()
+        distance = math.hypot(dx, dy)
+        target_orbit_angle = target_angle + math.pi
+        current_angle = math.atan2(dy, dx) if distance >= 1 else target_orbit_angle
+        angle_error = math.atan2(math.sin(target_orbit_angle - current_angle),
+                                 math.cos(target_orbit_angle - current_angle))
+
+        # 小步圆弧使每一段弦都在球外；偏离圆周时先径向调整。
+        if abs(distance - radius) > 20:
+            next_angle = current_angle
+        else:
+            next_angle = current_angle + max(-max_step, min(max_step, angle_error))
+        waypoint = CGeoPoint(ball_pos.x() + radius * math.cos(next_angle),
+                             ball_pos.y() + radius * math.sin(next_angle))
+        facing = (math.atan2(ball_pos.y() - player_pos.y(),
+                             ball_pos.x() - player_pos.x())
+                  if distance >= 1 and abs(angle_error) > 0.06 else target_angle)
+        return CppPackage.makeItSmartGoTo(
+            executor, waypoint, facing, flag, 0, 0, CVector(0, 0))
+
+    def matchPos(executor: int) -> CGeoPoint:
+        return Ball.pos() if Ball.valid() else Player.pos(executor)
+
+    return skill_cpp, matchPos
+
 
 def SmartGoTo(target: CGeoPoint, dir: typing.SupportsFloat, flag: typing.SupportsInt=0, *, sender: typing.SupportsInt=0, maxAcc: typing.SupportsInt=0, Velocity: CVector = CVector(0,0)) -> Any:
     """使用智能路径规划移动到 target，并转向 dir（弧度）。
