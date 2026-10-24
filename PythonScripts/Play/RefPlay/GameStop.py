@@ -7,7 +7,7 @@
 import Global
 from CppPackage import getPosModulePos
 from RoleMatch_LuaStyle import State, StateMachine, Task, declare_state_machine
-from RoleMatch_LuaStyle.Skills import RushTo
+from RoleMatch_LuaStyle.Skills import Goalie, RushTo
 from Vision import Ball, Player
 from WorldModel import Conditions, Flags
 from Play.RefPlay.OfficialSupport import (
@@ -35,9 +35,19 @@ class StopState(State):
 class Run(State):
     def getTasks(self):
         tasks = stop_tasks()
+        goalie_number = Global.goalieNumber
+        if goalie_number in controlled_numbers():
+            tasks[role_for(goalie_number)] = Task(
+                Goalie(),
+                fixedNumber=goalie_number,
+            )
         if not Ball.ball().Valid():
             return tasks
-        for index, number in enumerate(controlled_numbers(visible_only=True)[:STOP_POSITION_COUNT]):
+        field_numbers = tuple(
+            number for number in controlled_numbers(visible_only=True)
+            if number != goalie_number
+        )
+        for index, number in enumerate(field_numbers[:STOP_POSITION_COUNT]):
             tasks[role_for(number)] = Task(
                 RushTo(clamp_to_field(getPosModulePos(index, 1)),
                        angle=Player.toBallDir(number), maxAcc=ACC, flag=STOP_DSS),

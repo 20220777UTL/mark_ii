@@ -9,7 +9,7 @@ from Geometry import CGeoPoint
 from Vision import Ball, Enemy
 from WorldModel import Conditions, Params
 from RoleMatch_LuaStyle import State, StateMachine, declare_state_machine
-from Play.RefPlay.ExampleFreeKickDefend import _defend_tasks
+from .ExampleFreeKickDefend import _defend_tasks
 
 
 __all__ = ["ExampleKickOffDefend", "Leftpos", "Rightpos", "OTHER_POS", "EnemyBestRobot", "play_switch"]

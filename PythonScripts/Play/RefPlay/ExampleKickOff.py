@@ -1,7 +1,7 @@
 """我方开球定位球策略的辅助接口，供选手自行编写 3V3 状态机。
 
-文件末尾提供 ExampleKickOff 单状态占位，供 Config.py 导入；
-可在 KickOffState.getTasks() 填写任务，退出条件默认复用 play_switch()。
+文件末尾提供准备、执行两个状态，供 Config.py 导入。
+活球后交给新版 NormalPlay 重新检测球权，不写入旧版进攻状态变量。
 
 本文件提供点位、力度计算及定位球流程的默认退出判断；
 你在自己的状态机中决定哪辆车做什么、何时切换。
@@ -31,15 +31,17 @@
 import math
 
 import CppPackage
+import Global
 from Geometry import CGeoPoint, CVector
-from Vision import Ball
-from WorldModel import Conditions
+from Vision import Ball, Player
+from WorldModel import Conditions, Flags, kickStatus
 from WorldModel.PowerCalculator import P, evalPower
 from RoleMatch_LuaStyle import State, StateMachine, declare_state_machine, Task
-from RoleMatch_LuaStyle.Skills.Skill import *
-from Play.Normal.ExampleNormalPlay import parameters as p
-from Play.Normal.ExampleNormalPlay import utils as u
-from Play.Normal.ExampleNormalPlay import skills as s
+from RoleMatch_LuaStyle.Skills.Skill import Goalie, RushTo, SimpleGoTo, SmartGoTo
+from ..Normal.ExampleNormalPlay import parameters as p
+from ..Normal.ExampleNormalPlay import utils as u
+from ..Normal.NormalPlayActions import contact_velocity
+from .OfficialSupport import clamp_to_field, disable_ball_actions, stop_tasks
 from Global import debugEngine
 
 __all__ = ["ExampleKickOff", "getKickOffPos", "getAlignPos", "receiveBias", "KickPower", "play_switch"]
@@ -141,104 +143,147 @@ def play_switch():
     """
     return "exit" if Conditions.isGameOn() else ""
 
+def _kick_with_contact_velocity(target):
+    """替代无 vel 参数的 JustKick；调用者已检查当前持球和朝向。"""
+    ball_pos = Ball.pos()
+    direction = (target - ball_pos).dir()
+    movement, match_pos = RushTo(
+        ball_pos, direction, needDribble=True,
+        vel=contact_velocity(Ball.ball().Vel(), direction, p))
+    power = KickPower(target)
+
+    def execute(number):
+        movement(number)
+        kickStatus.setKick(number, power)
+
+    return execute, match_pos
+
+
 class KickOffStates:
-    kick_off_prep_pos : Any
     class KickOffPrepare(State):
-        """我方开球占位状态，在 getTasks 中填写具体战术。"""
-        
+        """每次开球选一次接应点；保存实际车号供执行状态沿用。"""
+
         def getTasks(self):
+            if not Ball.valid() or Conditions.isGameOn():
+                return stop_tasks()
+            if "target" not in self.context:
+                target = getKickOffPos()
+                if not (math.isfinite(target.x()) and math.isfinite(target.y())):
+                    return stop_tasks()
+                self.context["target"] = clamp_to_field(target)
             self.ballpos = Ball.pos()
-            self.kick_off_prep_pos = getKickOffPos()
-            KickOffStates.kick_off_prep_pos = self.kick_off_prep_pos
-            self.kick_off_pos = u.kick_ball_pos(self.ballpos, self.kick_off_prep_pos, prep_length=300)[1]
+            self.kick_off_prep_pos = self.context["target"]
+            if self.kick_off_prep_pos.dist(self.ballpos) < 1:
+                self.context.pop("target")
+                return stop_tasks()
+            self.kick_off_pos = u.kick_ball_pos(
+                self.ballpos, self.kick_off_prep_pos, prep_length=300)[1]
             return {
-                "A": Task(SmartGoTo(target = self.kick_off_prep_pos, dir = (self.ballpos - self.kick_off_prep_pos).dir(), flag = Flags.quickly)), #Prepare to receive the ball
-                "B": Task(SmartGoTo(target = self.kick_off_pos, dir = (self.kick_off_prep_pos - self.ballpos).dir(), flag = Flags.quickly)),
-                "G": Task(Goalie())
+                "A": Task(SmartGoTo(self.kick_off_prep_pos,
+                    (self.ballpos - self.kick_off_prep_pos).dir(), flag=Flags.quickly)),
+                "B": Task(SmartGoTo(self.kick_off_pos,
+                    (self.kick_off_prep_pos - self.ballpos).dir(), flag=Flags.quickly)),
+                "G": Task(Goalie(), fixedNumber=Global.goalieNumber),
             }
 
         def getMatchString(self):
-            return "(GAB)"
+            return "(AB)"
 
         def transFunction(self):
-            Anum = self.playerNum("A")
-            Bnum = self.playerNum("B")
-            Aarrive = u.arrive_at(self.kick_off_prep_pos, Anum)
-            Barrive = u.arrive_at(self.kick_off_pos, Bnum)
-            if(Aarrive and Barrive and Conditions.isNormalStart()):
+            if Conditions.isGameOn():
+                return "exit"
+            if not Ball.valid() or "A" not in self.tasks or "B" not in self.tasks:
+                return ""
+            receiver, passer = self.playerNum("A"), self.playerNum("B")
+            if receiver < 0 or passer < 0 or receiver == passer:
+                return ""
+            if (u.arrive_at(self.kick_off_prep_pos, receiver)
+                    and u.arrive_at(self.kick_off_pos, passer)
+                    and Conditions.isNormalStart()):
+                self.context.update(receiver=receiver, passer=passer)
                 return "KickOff"
             return ""
 
     class KickOff(State):
-        
         def __init__(self):
             super().__init__()
             self.reset()
 
         def reset(self):
-            u.WeGotBall = True
-            u.JustKickedOff = True
+            # 构造/重入只重置本状态；NormalPlay 自行维护球权。
             self.Bpassed = False
             self.BGotBall = False
             self.AGotBall = False
-            self.kick_off_prep_pos = None
+            self.kick_origin = None
 
         def run(self, isStateSwitched):
             if isStateSwitched:
                 self.reset()
             return super().run(isStateSwitched)
-        
+
         def getTasks(self):
+            if not Ball.valid() or Conditions.isGameOn() or not Conditions.isNormalStart():
+                return stop_tasks()
+            receiver, passer = self.context["receiver"], self.context["passer"]
+            if not Player.valid(receiver) or not Player.valid(passer):
+                return stop_tasks()
             self.ballpos = Ball.pos()
-            self.kick_off_prep_pos = KickOffStates.kick_off_prep_pos
-            self.kick_off_angle, self.kick_off_pos = u.kick_ball_pos(self.ballpos, self.kick_off_prep_pos, prep_length=p.ROBOT_MOUTH_RADIUS_MIN - 40)
-            self.residual_vel = u.toVector(p.KICK_OFF_RESIDUAL_VEL, self.kick_off_angle)
-
-            if not self.Bpassed:
-                self.Atask = Task(RushTo(self.kick_off_prep_pos, angle = (self.kick_off_pos - self.kick_off_prep_pos).dir(), needDribble=True)) #receive the ball
+            self.kick_off_prep_pos = self.context["target"]
+            angle, kick_pos = u.kick_ball_pos(self.ballpos, self.kick_off_prep_pos,
+                                              prep_length=p.ROBOT_MOUTH_RADIUS_MIN - 40)
+            current_hold = u.got_ball(passer)
+            self.BGotBall = self.BGotBall or current_hold
+            angle_error = abs(math.atan2(math.sin(Player.direction(passer) - angle),
+                                         math.cos(Player.direction(passer) - angle)))
+            if self.Bpassed:
+                bskill = SimpleGoTo(clamp_to_field(p.DEFAULT_POS), flag=Flags.dodge_ball | Flags.allow_dss)
+            elif current_hold and angle_error <= p.KICK_ANGLE:
+                if self.kick_origin is None:
+                    self.kick_origin = CGeoPoint(self.ballpos.x(), self.ballpos.y())
+                bskill = _kick_with_contact_velocity(self.kick_off_prep_pos)
             else:
-                self.Atask = Task(RushTo(self.ballpos, angle = (self.kick_off_pos - self.kick_off_prep_pos).dir(), needDribble=True))
-                # self.Atask = Task(StaticGetBallV4(...))
-            
-            if not self.BGotBall: #如果还没有拿到球
-                self.Btask = Task(RushTo(self.kick_off_pos, self.kick_off_angle, vel = self.residual_vel, needDribble=True)) # 去拿球
-                # self.Btask = Task(GetBall(flag = Flags.quickly))
-            elif not self.Bpassed : #如果拿到球了但是还没传
-                self.Btask = Task(JustKick(power = evalPower(Ball.rawPos(), self.kick_off_prep_pos, P.NORMAL), isChip=False, needDribble=True))
-                # self.Btask = Task(PassToPos(pos=self.kick_off_prep_pos, kickpower=7000))
-            else: # 如果已经传了
-                self.Btask = Task(SimpleGoTo(p.DEFAULT_POS))
-
-            debugEngine.gui_debug_msg(
-                p = p.DEBUG_MSG_POS,
-                msgstr=f"BGotBall={self.BGotBall},\nBpassed={self.Bpassed}",
-                debug_color=3
-            )
-            
+                bskill = RushTo(kick_pos, angle,
+                               vel=contact_velocity(Ball.ball().Vel(), angle, p), needDribble=True)
+            receive_target = self.ballpos if self.Bpassed else self.kick_off_prep_pos
+            debugEngine.gui_debug_msg(p.DEBUG_MSG_POS,
+                f"KO B{passer} hold={current_hold} passed={self.Bpassed} A{receiver}",
+                debug_color=3)
             return {
-                "A": self.Atask,
-                "B": self.Btask,
-                "G": Task(Goalie())
+                "A": Task(RushTo(receive_target,
+                    angle=(self.ballpos - self.kick_off_prep_pos).dir(), needDribble=True),
+                    fixedNumber=receiver),
+                "B": Task(bskill, fixedNumber=passer),
+                "G": Task(Goalie(), fixedNumber=Global.goalieNumber),
             }
 
         def getMatchString(self):
-            return "(GAB)"
+            return ""  # 三个实际车号均显式固定，不在切状态时重新匹配。
 
         def transFunction(self):
-            
-            Anum = self.playerNum("A")
-            Bnum = self.playerNum("B")
-            u.OurLastHolder = Bnum
-            if not self.BGotBall: # B 拿到球了 不会重新变成False
-                self.BGotBall = u.got_ball(Bnum)
-            if self.BGotBall and not self.Bpassed:
-                self.Bpassed = (Player.pos(Bnum) - self.ballpos).mod() > p.LEAVE_THRESHOLD
-            self.AGotBall = u.got_ball(Anum)
-            if(self.Bpassed and self.AGotBall): # B 传出去 并且 A 拿到球 离开 KickOff脚本
+            # 外层也可能直接切走；不要求最后一帧一定执行到这里。
+            if Conditions.isGameOn():
                 return "exit"
-            return ""
+            if not Ball.valid() or "A" not in self.tasks or "B" not in self.tasks:
+                return ""
+            receiver, passer = self.playerNum("A"), self.playerNum("B")
+            if receiver < 0 or passer < 0:
+                return ""
+            if self.kick_origin is not None:
+                departed = (self.kick_origin.dist(Ball.pos()) > p.BALL_DEPART_DISTANCE
+                            and Player.pos(passer).dist(Ball.pos()) > p.MOUTH_MAX + 40)
+                self.Bpassed = self.Bpassed or Player.kickBallVision(passer) or departed
+            self.AGotBall = u.got_ball(receiver)
+            return "exit" if self.Bpassed and self.AGotBall else ""
+
 
 @declare_state_machine(KickOffStates.KickOffPrepare, KickOffStates.KickOff)
 class ExampleKickOff(StateMachine):
-    pass
-    """供裁判策略调度使用的我方开球状态机。"""
+    """我方开球；上下文属于本次 Play 实例，不跨实例/跨次开球残留。"""
+
+    def hookBeforePlanTasks(self):
+        if Global.isPlaySwitched:
+            self.context.clear()
+        for state in self.states.values():
+            state.context = self.context
+        Global.hasFinishedRefPlay = False
+        disable_ball_actions()

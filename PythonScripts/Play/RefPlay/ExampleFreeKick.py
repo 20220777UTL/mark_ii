@@ -1,7 +1,7 @@
 """我方任意球定位球策略辅助接口，供 3V3 选手自行编写状态机。
 
-文件末尾提供 ExampleFreeKick 单状态占位，供 Config.py 导入；
-可在 FreeKickState.getTasks() 填写任务，退出条件默认复用 play_switch()。
+文件末尾提供 ExampleFreeKick 任意球流程，供 Config.py 导入。
+活球后退出，交给新版 NormalPlay 重新检测球权；不写旧版 PendingReceive。
 
 这里提供位置、方向、力度计算及定位球流程的默认退出判断；
 不分配角色、不生成 Task、不推进状态。
@@ -26,7 +26,8 @@
 
 调用示例（在每帧计算任务时获取新结果，而不是放在文件顶部执行）：
     from Play.RefPlay.ExampleFreeKick import ReceivePos, KickPower
-    target = ReceivePos()       # 获得一个接球候选点，尚未命令任何车移动
+    target = ReceivePos()       # 获得一个接球候
+    选点，尚未命令任何车移动
     power = KickPower(target)   # 获得传到此点的力度，尚未命令任何车踢球
 
 使用比赛程序自动计算的接应点（在每帧运行的函数中查询）：
@@ -58,6 +59,8 @@ import Global
 from RoleMatch_LuaStyle import Task
 from RoleMatch_LuaStyle.Skills import Skill
 from WorldModel import Flags
+
+from .OfficialSupport import disable_ball_actions, stop_tasks
 
 __all__ = [
     "ExampleFreeKick",
@@ -447,23 +450,121 @@ def play_switch():
     return "exit" if Conditions.isGameOn() else ""
 
 
+def _segment_avoids_ball(start, end, ball_pos, clearance=200):
+    """检查车中心的直线路径是否始终离球至少 clearance mm。"""
+    dx, dy = end.x() - start.x(), end.y() - start.y()
+    length_sq = dx * dx + dy * dy
+    if length_sq == 0:
+        closest_x, closest_y = start.x(), start.y()
+    else:
+        ratio = max(0.0, min(1.0, ((ball_pos.x() - start.x()) * dx
+                                      + (ball_pos.y() - start.y()) * dy) / length_sq))
+        closest_x = start.x() + ratio * dx
+        closest_y = start.y() + ratio * dy
+    return math.hypot(closest_x - ball_pos.x(), closest_y - ball_pos.y()) >= clearance
+
+
+def _route_to_first_point(start, ball_pos, first_pos):
+    """直达若穿过球旁，则找一条场内、逐段避球的折线路线。"""
+    if _segment_avoids_ball(start, first_pos, ball_pos):
+        return [first_pos]
+
+    clearance = 200
+    field_y = Params.pitchWidth / 2 - Params.playerRadius - 10
+    field_x = Params.pitchLength / 2 - Params.playerRadius - 10
+    if start.dist(ball_pos) < clearance:
+        # NormalPlay 可能正持球：起点已在避球圆内，不能要求整段都在圆外。
+        # 先沿不靠近球的方向退到圆外，再复用原路线；不穿过球心。
+        away = start - ball_pos
+        base_angle = away.dir() if away.mod() > 1 else (first_pos - ball_pos).dir()
+        escapes = []
+        for offset in (0, math.pi / 4, -math.pi / 4, math.pi / 2, -math.pi / 2):
+            delta = Polar2Vector(2 * clearance + 30, base_angle + offset)
+            escape = start + delta
+            if abs(escape.x()) > field_x or abs(escape.y()) > field_y:
+                continue
+            route = _route_to_first_point(escape, ball_pos, first_pos)
+            if route is not None:
+                points = [start, escape, *route]
+                length = sum(a.dist(b) for a, b in zip(points, points[1:]))
+                escapes.append((length, [escape, *route]))
+        return min(escapes, key=lambda item: item[0])[1] if escapes else None
+    routes = []
+    for side in (-1, 1):
+        lane_y = ball_pos.y() + side * (clearance + 30)
+        if abs(lane_y) > field_y:
+            continue
+        lane_start = CGeoPoint(start.x(), lane_y)
+        lane_end = CGeoPoint(first_pos.x(), lane_y)
+        candidates = [[lane_start, lane_end, first_pos]]
+        escape_x = ball_pos.x() + (clearance + 30) * (1 if start.x() >= ball_pos.x() else -1)
+        if abs(escape_x) <= Params.pitchLength / 2 - Params.playerRadius - 10:
+            candidates.append([CGeoPoint(escape_x, start.y()),
+                               CGeoPoint(escape_x, lane_y), lane_end, first_pos])
+        for route in candidates:
+            points = [start] + route
+            if all(_segment_avoids_ball(a, b, ball_pos)
+                   for a, b in zip(points, points[1:])):
+                length = sum((b - a).mod() for a, b in zip(points, points[1:]))
+                routes.append((length, route))
+    return min(routes, key=lambda item: item[0])[1] if routes else None
+
+
+def _stop_match_ball():
+    """首帧停住 A，同时让匹配器按距球距离选择发球车。"""
+    stop_cpp, _ = Skill.Stop()
+    return stop_cpp, lambda executor: Ball.pos()
+
+
+ROUTE_WAYPOINT_TOLERANCE = 80  # mm：绕球中间路点的到达范围
+FIRST_POINT_TOLERANCE = 60  # mm：第一待球点的到达范围
+
+
 class FreeKickState(State):
-    """我方任意球占位状态，在 getTasks 中填写具体战术。"""
+    """按本次选定的发球车和接应车执行；每次进入重置路线和传球阶段。"""
+
+    def __init__(self):
+        super().__init__()
+        self.reset()
+
+    def reset(self):
+        self.stage = "wait_first"
+        self.receive_pos = None
+        self.second_pos = None
+        self.first_route = None
+        self.first_route_index = 0
+        self.first_route_car = -1
+        self.passer = self.receiver = -1
+        self.tasks = {}
+
+    def run(self, isStateSwitched):
+        if isStateSwitched:
+            self.reset()
+        return super().run(isStateSwitched)
+
+    def _fixed_tasks(self, tasks):
+        tasks["G"].setFixedNumber(Global.goalieNumber)
+        if self.passer >= 0:
+            tasks["A"].setFixedNumber(self.passer)
+        if self.receiver >= 0:
+            tasks["B"].setFixedNumber(self.receiver)
+        return tasks
 
     def getTasks(self):
-        # 新增：每次进入任意球重新选点，选到后本次传球保持不变。
-        if Global.isPlaySwitched or not hasattr(self, "stage"):
-            self.stage = "wait_first"
-            self.receive_pos = None
-            self.second_pos : CGeoPoint
+        if not Ball.valid() or Conditions.isGameOn():
+            return stop_tasks()
+        new_round = self.passer < 0
 
         if self.receive_pos is None:
             target = getFreeKickPos(0)  # 0 是候选点编号，不是机器人编号。
             if target is None:
                 debugEngine.gui_debug_msg(CGeoPoint(0, 2500), "FK: waiting for point")
-                return {"G": Task(Skill.Goalie()),
-                        "A": Task(Skill.Stop()), "B": Task(Skill.Stop())}
-            self.receive_pos = CGeoPoint(target.x(), target.y())
+                return self._fixed_tasks({"G": Task(Skill.Goalie()),
+                        "A": Task(_stop_match_ball()), "B": Task(Skill.Stop())})
+            # 官方候选点可能落在对方禁区内；接球车不能把那里当作跑位终点。
+            self.receive_pos = _legal_receive_pos(
+                target, penalty_buffer=200,
+                field_margin=Params.playerRadius + 10)
             self.pass_dir = Ball.toPointDir(self.receive_pos)
             ball_pos = Ball.pos()
             # 我方球门在负 x 方向：第一点从球向我方球门退 400 mm。
@@ -471,55 +572,108 @@ class FreeKickState(State):
             first_x = max(ball_pos.x() - 400,
                           Positions.ourGoal.x() + Params.playerRadius + 10)
             first_dy = 100 if ball_pos.y() >= 0 else -100
-            self.first_pos = CGeoPoint(first_x,
-                                       ball_pos.y() + first_dy)
+            self.first_pos = _clamp_in_field(
+                CGeoPoint(first_x, ball_pos.y() + first_dy), Params.playerRadius + 10)
+            if self.first_pos.dist(ball_pos) < 230:
+                # 底线裁剪会缩短后退距离；第一待球点本身也必须在避球圆外。
+                for side in (1 if first_dy > 0 else -1, -1 if first_dy > 0 else 1):
+                    candidate = _clamp_in_field(
+                        CGeoPoint(first_x, ball_pos.y() + side * 230), Params.playerRadius + 10)
+                    if candidate.dist(ball_pos) >= 230:
+                        self.first_pos = candidate
+                        break
 
         debugEngine.gui_debug_msg(CGeoPoint(0, 2500), f"FK: {self.stage}")
         debugEngine.gui_debug_msg(self.receive_pos, "FK0 target", debug_color=3)
+        if self.stage == "wait_first":
+            debugEngine.gui_debug_msg(self.first_pos, "FK first", debug_color=3)
         receive_dir = Normalize(self.pass_dir + math.pi)
         tasks = {"G": Task(Skill.Goalie())}
 
         # A 先到第一待球点，再到球背对 B 的第二待球点。
         if self.stage == "wait_first":
-            tasks["A"] = Task(Skill.SimpleGoTo(
-                self.first_pos, self.pass_dir, flag=Flags.allow_dss))
+            # 首帧尚未完成角色分配，self.tasks 中还没有 A；先下发一帧停止任务，
+            # 下一帧再用已分配的车号计算避球路线。
+            passer = self.passer
+            if passer >= 0 and passer in Player.getAllValidNumbers():
+                if self.first_route_car != passer or self.first_route is None:
+                    self.first_route = _route_to_first_point(
+                        Player.pos(passer), Ball.pos(), self.first_pos)
+                    self.first_route_index = 0
+                    self.first_route_car = passer
+                if self.first_route is not None:
+                    while (self.first_route_index < len(self.first_route) - 1
+                           and Player.toPointDist(passer, self.first_route[self.first_route_index]) < ROUTE_WAYPOINT_TOLERANCE):
+                        self.first_route_index += 1
+                    debugEngine.gui_debug_msg(
+                        self.first_route[self.first_route_index], "FK waypoint", debug_color=3)
+                    tasks["A"] = Task(Skill.SimpleGoTo(
+                        self.first_route[self.first_route_index], self.pass_dir,
+                        flag=Flags.allow_dss))
+                else:
+                    tasks["A"] = Task(Skill.Stop())
+                    debugEngine.gui_debug_msg(self.first_pos, "FK: no safe first route")
+            else:
+                tasks["A"] = Task(_stop_match_ball()) if new_round else Task(Skill.Stop())
         elif self.stage == "wait_second":
             tasks["A"] = Task(Skill.SimpleGoTo(
                 self.second_pos, self.pass_dir, flag=Flags.allow_dss))
-        elif self.stage == "pass":
+        elif self.stage == "pass" and Conditions.isNormalStart():
             tasks["A"] = Task(Skill.StaticGetBallV4(
                 self.receive_pos,
                 direction=Ball.toPointDir(self.receive_pos),
-                power=KickPower(self.receive_pos), isChip=False))
-        else:  # done：已踢出，A 停止本次传球。
+                power=min(Global.powerMax,
+                          getChipPower_DirectKick(target=self.receive_pos) * 1.2),
+                isChip=True))
+        else:  # done 或未获开球许可：停止本次出球。
             tasks["A"] = Task(Skill.Stop())
 
-        # B 跑向同一个接球点，传球开始后开启吸球等待接球。
+        # B 本轮始终负责接球，准备阶段也不加 dodge_ball；出球阶段开启吸球。
         if self.stage in ("wait_first", "wait_second"):
-            tasks["B"] = Task(Skill.SimpleGoTo(
+            tasks["B"] = Task(Skill.SmartGoTo(
                 self.receive_pos, receive_dir,
-                flag=Flags.dodge_ball | Flags.allow_dss))
+                flag=Flags.allow_dss))
         else:
             tasks["B"] = Task(Skill.RushTo(
                 self.receive_pos, angle=receive_dir,
                 flag=Flags.allow_dss, needDribble=True))
-        return tasks
-        # 原模板占位行保留；上面已经返回本帧任务。
-        return {}
+        return self._fixed_tasks(tasks)
 
     def getMatchString(self):
-        # 准备时动态匹配 A/B；开始对准后保留本轮分工，不指定实际车号。
-        return "[AB]" if self.stage == "wait_first" else "(AB)"
-        # 原模板占位行保留。
-        return ""
+        # 进入本轮时先给距球最近的场上车分配 A，再给另一辆车分配 B；之后保持分工。
+        return "(A)(B)"
 
     def transFunction(self):
+        # 任一阶段都接受活球退出，不能仅在 kickBallVision 成功后退出。
+        if Conditions.isGameOn():
+            return "exit"
+        if not Ball.valid() or "A" not in self.tasks or "B" not in self.tasks:
+            return ""
+        passer, receiver = self.playerNum("A"), self.playerNum("B")
+        if passer < 0 or receiver < 0 or passer == receiver:
+            return ""
+        self.passer, self.receiver = passer, receiver
         if self.receive_pos is None:
             return ""
 
         if self.stage == "wait_first":
-            if (Player.toPointDist("A", self.first_pos) < 30
-                    and Player.toPointDist("B", self.receive_pos) < 150
+            if (self.first_route is not None
+                    and self.playerNum("A") >= 0 and self.playerNum("B") >= 0):
+                waypoint = self.first_route[self.first_route_index]
+                debugEngine.gui_debug_msg(
+                    CGeoPoint(-5200, -2700),
+                    f"FK route {self.first_route_index + 1}/{len(self.first_route)} "
+                    f"A{self.playerNum('A')} first={Player.toPointDist('A', self.first_pos):.0f} "
+                    f"way={Player.toPointDist('A', waypoint):.0f}", debug_color=3)
+                debugEngine.gui_debug_msg(
+                    CGeoPoint(-5200, -3000),
+                    f"B{self.playerNum('B')} target={Player.toPointDist('B', self.receive_pos):.0f} "
+                    f"vel={Player.velMod('B'):.0f} ball={int(Ball.valid())} "
+                    f"start={int(Conditions.isNormalStart())}", debug_color=3)
+            if (self.first_route is not None
+                    and self.first_route_index == len(self.first_route) - 1
+                    and Player.toPointDist("A", self.first_pos) < FIRST_POINT_TOLERANCE
+                    and Player.toPointDist("B", self.receive_pos) < 200
                     and Player.velMod("B") < 150):
                 self.second_pos = WaitBallPos2("B", behind_dist=150)
                 self.pass_dir = Ball.toPointDir(self.receive_pos)
@@ -527,7 +681,8 @@ class FreeKickState(State):
         elif self.stage == "wait_second":
             if (Player.toPointDist("A", self.second_pos) < 30
                     and Player.velMod("A") < 150
-                    and abs(Normalize(Player.direction("A") - self.pass_dir)) < 0.2):
+                    and abs(Normalize(Player.direction("A") - self.pass_dir)) < 0.2
+                    and Conditions.isNormalStart()):
                 self.stage = "pass"
         elif self.stage == "pass" and Player.kickBallVision("A"):
             self.stage = "done"
@@ -545,3 +700,4 @@ class ExampleFreeKick(StateMachine):
     def hookBeforePlanTasks(self):
         # 由上面的 play_switch() 通知框架本次任意球结束。
         Global.hasFinishedRefPlay = False
+        disable_ball_actions()

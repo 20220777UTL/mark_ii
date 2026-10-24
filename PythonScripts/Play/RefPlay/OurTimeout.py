@@ -7,7 +7,7 @@ import Global
 from RoleMatch_LuaStyle import State, StateMachine, Task, declare_state_machine
 from RoleMatch_LuaStyle.Skills import RushTo
 from WorldModel import Conditions, Flags, Positions
-from Play.RefPlay.OfficialSupport import (
+from .OfficialSupport import (
     clamp_to_field, controlled_numbers, disable_ball_actions, role_for, stop_tasks,
 )
 

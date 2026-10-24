@@ -4,7 +4,7 @@
 """
 
 from RoleMatch_LuaStyle import State, StateMachine, declare_state_machine
-from Play.RefPlay.OfficialSupport import disable_ball_actions, stop_tasks
+from .OfficialSupport import disable_ball_actions, stop_tasks
 
 
 class Halt(State):

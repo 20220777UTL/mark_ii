@@ -17,7 +17,8 @@ from Play.Test.ExampleTest import ExampleTest
 
 Global.isTestMode = False
 Global.needDetailedRuntimeDebugInfo = False
-# 本届 3V3 的默认车号；按实际队伍修改。设为 None 可恢复按全部有效车辆匹配。
+# 比赛默认自动识别车号；本地固定三车调试可改成 (0, 1, 2)。
+# NormalPlay 从视觉选择两名场上队员，守门员仍由 goalieNumber 固定。
 Global.controlledRobotNumbers = (0, 1, 2)
 Global.goalieNumber = 0
 if (Global.controlledRobotNumbers is not None

@@ -1,4 +1,4 @@
-"""两个场上队员 + 固定 Goalie；每次调度都明确安排两人的动作。
+﻿"""两个场上队员 + 固定 Goalie；每次调度都明确安排两人的动作。
 
 Get/Defend：我方持球→Attack，对方持球→Defend，无人持球→Get。
 Attack：对方持球才转 Defend；自由球在 Attack 内回收；射门后下一次调度直接 Get。
@@ -13,7 +13,7 @@ from Geometry import CGeoPoint
 from RoleMatch_LuaStyle import State, StateMachine, Task
 from RoleMatch_LuaStyle.Skills import Skill
 from Vision import Ball, Player, Enemy
-from WorldModel import Params, Positions, kickStatus, worldModel
+from WorldModel import Params, Positions, Flags, kickStatus, worldModel
 from WorldModel.PowerCalculator import P
 from . import NormalPlayActions as actions
 from . import NormalPlayGeometry as geo
@@ -33,7 +33,12 @@ class parameters:
     MOUTH_MAX = 135
     MOUTH_HALF_WIDTH = 38
     MOUTH_OFFSET = Params.playerFrontToCenter + 21.5
-    KICK_ANGLE = math.radians(2)  # 传球、射门统一 2°，不再按距离收紧。
+    KICK_ANGLE = math.radians(5)  # 传球、射门统一 5°。
+    KICK_CONTACT_SPEED = 600.0  # mm/s：触球目标速度相对球，沿出球方向。
+    CONTACT_LATERAL_TOLERANCE = 8.0  # mm：先横向对中，再前移。
+    CONTACT_PRESS_DEPTH = 20.0       # mm：SimpleGoTo 目标比名义接触位置前移。
+    CONTACT_MIN_ADVANCE = 10.0       # mm：必须由后续视觉帧观测到实际前移。
+    CONTACT_NEAR_MARGIN = 8.0        # mm：结束前移时车嘴纵向接近容差。
     CONTROL_FRAMES = 3 if SIMULATION else 5  # 保留的球权确认次数；非 cycle 连续性检测。
     FREE_FRAMES = 2 if SIMULATION else 3
 
@@ -54,7 +59,7 @@ class parameters:
     RECEIVE_ROLL_SPEED = 250
     RECEIVE_LOOKAHEAD = 0.8
     CUSHION_TIME = 0.20 if SIMULATION else 0.28
-    CUSHION_SPEED = 650 if SIMULATION else 450
+    CUSHION_SPEED = 650 if SIMULATION else 600
     CUSHION_RATIO = 0.35
 
     # 保留 ExampleKickOff 依赖的接口参数。
@@ -98,8 +103,8 @@ class utils:
         robot = geo.Robot(role, api.pos(role), heading, api.vel(role))
         result = geo.in_mouth(robot, Ball.pos(), p)
         # 真车更严格的可选判断；仿真按要求保持注释。
-        # if not isEnemy:
-        #     result = result and Player.isInfraredOn(role)
+        if not isEnemy:
+            result = result and Player.isInfraredOn(role)
         return result
 
 
@@ -126,7 +131,9 @@ class _NormalState(State):
         # 每个分支必须显式安排两人；没有默认 Stop，也不吞掉遗漏任务的问题。
         tasks = {role: Task(orders[number], fixedNumber=number)
                  for role, number in zip(("A", "B"), self.play.field_numbers)}
-        tasks["G"] = Task(Skill.Goalie(), fixedNumber=self.play.goalie)
+        # 同期射门时门将避球；其它状态保持原守门/接球能力。
+        goalie_flags = Flags.dodge_ball if self.play.stage == "shoot" else 0
+        tasks["G"] = Task(Skill.Goalie(flag=goalie_flags), fixedNumber=self.play.goalie)
         for role, number in zip(("A", "B"), self.play.field_numbers):
             geo.note(self.play.frame, role, f"R{number} target={orders[number][1](number)}")
         return tasks
@@ -168,6 +175,7 @@ class ExampleNormalPlay(StateMachine):
         self.support_target, self.support_cycle = None, -100000
         self.shot_target = None
         self.stage = "recover"
+        self.capture = {number: actions.ContactPreparation() for number in self.field_numbers}
 
     @staticmethod
     def next_state(current, control):
@@ -186,13 +194,15 @@ class ExampleNormalPlay(StateMachine):
         candidates = []
         for team, robots in ((1, f.ours), (0, f.enemies)):
             for number, robot in robots.items():
-                if geo.geometric_holder(robot, f, p):
-                    candidates.append((robot.pos.dist(f.ball), team, number))
-                elif team == 1 and number in self.field_numbers:
+                has_ball_at_mouth = geo.geometric_holder(robot, f, p)
+                if team == 1 and number in self.field_numbers:
                     forward, lateral = geo.mouth_coordinates(robot, f.ball)
                     geo.note(f, f"MOUTH_R{number}",
+                             f"{'IN' if has_ball_at_mouth else 'OUT'} "
                              f"forward={forward:.0f} [{p.MOUTH_MIN},{p.MOUTH_MAX}] "
                              f"lateral={lateral:.0f} +/-{p.MOUTH_HALF_WIDTH}")
+                if has_ball_at_mouth:
+                    candidates.append((robot.pos.dist(f.ball), team, number))
         # 双方都在嘴前时，按球到车中心的几何距离选人，不再优先判敌方。
         # 真车严格红外可在我方候选加入前加 Player.isInfraredOn(number)，先保持注释。
         winner = min(candidates, key=lambda item: item[0], default=None)
@@ -213,11 +223,19 @@ class ExampleNormalPlay(StateMachine):
         Global.debugEngine.gui_debug_msg(p.DEBUG_MSG_POS,
             f"Normal {self.current_state.state_name} control={ball_control} "
             f"holder={self.holder} {self.stage}", size=75)
-        for index, (key, value) in enumerate(f.messages.items()):
-            column, row = divmod(index, 24)
-            pos = CGeoPoint(p.DEBUG_MSG_POS.x() + column * Params.pitchLength / 2,
-                            p.DEBUG_MSG_POS.y() - (row + 1) * 105)
-            Global.debugEngine.gui_debug_msg(pos, f"{key}: {value}", size=65)
+        # 界面只保留球权和车嘴几何判断，避免把每项策略原因每帧都送进原生绘制层。
+        for row, number in enumerate(self.field_numbers, start=1):
+            status = f.messages.get(f"MOUTH_R{number}", "no geometry sample")
+            contact = f.messages.get(f"CONTACT_R{number}")
+            if contact:
+                status += " | " + contact
+            pos = CGeoPoint(p.DEBUG_MSG_POS.x(), p.DEBUG_MSG_POS.y() - row * 105)
+            Global.debugEngine.gui_debug_msg(pos, f"MOUTH_R{number}: {status}", size=65)
+        confirm = f.messages.get("CONTROL_CONFIRM")
+        if confirm is not None:
+            pos = CGeoPoint(p.DEBUG_MSG_POS.x(),
+                            p.DEBUG_MSG_POS.y() - (len(self.field_numbers) + 1) * 105)
+            Global.debugEngine.gui_debug_msg(pos, f"CONTROL: {confirm}", size=65)
 
     def planTasks(self):
         if Global.isPlaySwitched:
@@ -225,6 +243,9 @@ class ExampleNormalPlay(StateMachine):
         self.frame = geo.read_frame(self.our_numbers, self.enemy_numbers)
         geo.note(self.frame, "NATIVE_FLAGS", "DSS=on our_box=on; movement may dodge_ball")
         self.update_ball_control()
+        for number in self.field_numbers:
+            if not geo.geometric_holder(self.frame.ours[number], self.frame, p):
+                self.capture[number].reset()
         if self.after_shot_get:
             desired = "Get"  # 发出射门指令后的下一次调度直接抢球，没有 Stop/确认等待。
             self.after_shot_get = False
@@ -238,7 +259,7 @@ class ExampleNormalPlay(StateMachine):
             worldModel.SPlayFSMSwitchClearAll(True)
         kickStatus.clearAll()
         for number in self.field_numbers:
-            C.setDribbleCommand(number, 0)  # 保留的先清再由本帧技能设置机制。
+            C.setDribbleCommand(number, 3)  # 保留的先清再由本帧技能设置机制。
         self.current_state.run(changed)
         self.isStateSwitched = False
         self.draw_debug()
@@ -281,10 +302,10 @@ class ExampleNormalPlay(StateMachine):
         f = self.frame
         closest = min(self.field_numbers, key=lambda n: f.ours[n].pos.dist(f.ball))
         other = next(n for n in self.field_numbers if n != closest)
-        return {closest: actions.get_ball(f.ours[closest], f, p), other: self.marker(other)}
+        return {closest: actions.get_ball(f.ours[closest], f, p, capture=self.capture[closest]), other: self.marker(other)}
 
     def defend(self):
-        from Play.RefPlay.ExampleFreeKickDefend import _kicker_block_pos
+        from ..RefPlay.ExampleFreeKickDefend import _kicker_block_pos
         self.stage = "mark"
         f = self.frame
         kicker = self.holder if ball_control == 0 else min(
@@ -309,16 +330,12 @@ class ExampleNormalPlay(StateMachine):
         candidates = []
         for index, target in enumerate(geo.goal_targets(p)):
             enemy = geo.lane_blockers(f.ball, target, f.enemies, p.LANE_WIDTH)
-            own = geo.lane_blockers(f.ball, target, f.ours, p.LANE_WIDTH, exclude=(shooter,))
             if enemy:
                 geo.note(f, f"SHOT_P{index}", f"enemy blockers={enemy}")
                 continue
-            if self.goalie in own:
-                geo.note(f, f"SHOT_P{index}", "goalie on line; G remains Goalie")
-                continue
             locked = self.shot_target is not None and self.shot_target[0] == shooter and self.shot_target[1].dist(target) < 1
             turn = geo.angle_error(robot.heading, (target - f.ball).dir())
-            candidates.append(((len(own), not locked, turn), target))
+            candidates.append(((not locked, turn), target))
         return min(candidates, key=lambda item: item[0])[1] if candidates else None
 
     def shoot(self, shooter, target):
@@ -329,13 +346,15 @@ class ExampleNormalPlay(StateMachine):
         clear = self.clearance_position(f.ours[other], target)
 
         def fired():
+            self.capture[shooter].reset()
             self.after_shot_get = True
             self.stage = "shot->Get"
 
         return {
-            # 明确给无球队员 dodge_ball，实际站位尚挡射线时 shoot_ball 显示原因并等待清线。
+            # 同期无球队员避球并让出射线；射门不再等待我方清线。
             other: self.move_runner(other, clear, avoid_ball=True),
-            shooter: actions.shoot_ball(f.ours[shooter], f, target, p, on_fire=fired),
+            shooter: actions.shoot_ball(f.ours[shooter], f, target, p, on_fire=fired,
+                                        capture=self.capture[shooter]),
         }
 
     def pass_candidate(self, receiver):
@@ -387,7 +406,8 @@ class ExampleNormalPlay(StateMachine):
     def hold_and_support(self, holder):
         self.stage = "hold/reassess"
         other = next(n for n in self.field_numbers if n != holder)
-        return {holder: actions.hold_ball(self.frame.ours[holder], self.frame, p),
+        return {holder: actions.hold_ball(self.frame.ours[holder], self.frame, p,
+                                          capture=self.capture[holder]),
                 other: self.support(other, holder)}
 
     def ball_departed(self, plan):
@@ -410,18 +430,22 @@ class ExampleNormalPlay(StateMachine):
                 self.stage = "pass/reget"
                 geo.note(f, "PASS_REGET", "mouth condition false; keep plan and get ball")
                 return {
-                    plan.passer: actions.get_ball(f.ours[plan.passer], f, p),
-                    plan.receiver: actions.receive_ball(f.ours[plan.receiver], f, plan.target, f.ball, p),
+                    plan.passer: actions.get_ball(f.ours[plan.passer], f, p, capture=self.capture[plan.passer]),
+                    plan.receiver: actions.receive_ball(f.ours[plan.receiver], f, plan.target, f.ball, p,
+                                                        capture=self.capture[plan.receiver]),
                 }
             # TODO：出球前路线恶化可重新选点；按约定仅注释，不加入执行条件。
             def fired():
+                self.capture[plan.passer].reset()
                 plan.phase, plan.origin = "confirm", f.ball
                 plan.run_target = self.run_position(plan.passer)
 
             self.stage = "pass/prepare"
             return {
-                plan.passer: actions.pass_ball(f.ours[plan.passer], f, plan.target, p, on_fire=fired),
-                plan.receiver: actions.receive_ball(f.ours[plan.receiver], f, plan.target, f.ball, p),
+                plan.passer: actions.pass_ball(f.ours[plan.passer], f, plan.target, p, on_fire=fired,
+                                                  capture=self.capture[plan.passer]),
+                plan.receiver: actions.receive_ball(f.ours[plan.receiver], f, plan.target, f.ball, p,
+                                                        capture=self.capture[plan.receiver]),
             }
         if plan.phase == "confirm" and self.ball_departed(plan):
             plan.phase = "receive"
@@ -429,7 +453,8 @@ class ExampleNormalPlay(StateMachine):
         return {
             plan.passer: self.move_runner(plan.passer, plan.run_target),
             plan.receiver: actions.receive_ball(f.ours[plan.receiver], f, plan.target, plan.origin,
-                                                 p, in_flight=plan.phase == "receive"),
+                                                 p, in_flight=plan.phase == "receive",
+                                                 capture=self.capture[plan.receiver]),
         }
 
     def attack(self):

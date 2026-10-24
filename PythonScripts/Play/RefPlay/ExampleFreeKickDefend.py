@@ -14,7 +14,7 @@ from Vision import Ball, Enemy, Player
 from WorldModel import Conditions, Params, Positions, Flags
 from RoleMatch_LuaStyle import State, StateMachine, Task, declare_state_machine
 from RoleMatch_LuaStyle.Skills import Skill
-from Play.RefPlay.OfficialSupport import disable_ball_actions, stop_tasks
+from .OfficialSupport import disable_ball_actions, stop_tasks
 
 
 __all__ = ["ExampleFreeKickDefend", "getAttackerNum", "getFreeKickDefPos", "EnemyBestRobot", "nearest1", "play_switch"]
@@ -198,11 +198,7 @@ def _legal_defend_pos(point, ball, kickoff, *, goalie=False, occupied=()):
 
 def _defend_tasks(*, kickoff=False):
     """两种定位球的共用任务：G 守门、A 封射门、B 盯接应者。"""
-    # 延迟导入，避免 RefPlay 与 NormalPlay 在加载时互相引用。
-    from Play.Normal.ExampleNormalPlay import utils as u
-
-    # 对方定位球期间不保留我方上轮进攻的控球/发球者状态。
-    u.WeGotBall, u.OurLastHolder, u.JustKickedOff = False, -1, False
+    # 球权只由 NormalPlay 在重入后检测；这里不改它的内部状态。
     Global.hasFinishedRefPlay = False
     disable_ball_actions()
     if not Ball.valid():
