@@ -1,11 +1,7 @@
-"""NormalPlay 的视觉快照、几何判断；不下发运动或踢球命令。
-
-距离 mm，速度 mm/s，角度 rad。视觉坐标已经归一化为向 +X 进攻。
-"""
-from dataclasses import dataclass
+"""NormalPlay 几何与快照：位置 mm，速度 mm/s，朝向 rad；向 +X 进攻。"""
+from dataclasses import dataclass, field
 import math
 
-import CppPackage as C
 from Geometry import CGeoPoint, CVector
 from Vision import Ball, Player, Enemy, vision
 from WorldModel import Params, Positions
@@ -17,10 +13,6 @@ def vector(length, angle):
 
 def angle_error(a, b):
     return abs(math.atan2(math.sin(a - b), math.cos(a - b)))
-
-
-def finite(point):
-    return math.isfinite(point.x()) and math.isfinite(point.y())
 
 
 @dataclass
@@ -40,64 +32,64 @@ class Frame:
     enemies: dict
     airborne: bool
     landing: object = None
+    messages: dict = field(default_factory=dict)
 
 
-def read_frame():
-    """同一帧统一读取；不缓存导入时的 native ball 对象。"""
-    def robots(api, heading):
+def note(frame, key, text):
+    """同一帧同一条件只显示一行；键和值均用 ASCII，兼容场地图字体。"""
+    frame.messages[key] = text
+
+
+def read_frame(our_numbers, enemy_numbers):
+    """我方固定三辆车始终读取；已发现的对手不会因一帧 Valid 变化被剔除。
+
+    Enemy.valid 仅用于发现尚未登记的对手车号，避免把 16 个槽位全当成上场车辆。
+    没有球 Valid/None 判断，没有缺帧停车、配合取消或坐标有限性淘汰。
+    """
+    enemy_numbers.update(n for n in range(Params.maxPlayer) if Enemy.valid(n))
+
+    def robots(api, heading, numbers):
         result = {}
-        for number in range(Params.maxPlayer):
-            if not api.valid(number):
-                continue
-            pos, vel, direction = api.pos(number), api.vel(number), heading(number)
-            if finite(pos) and finite(vel) and math.isfinite(direction):
-                result[number] = Robot(number, CGeoPoint(pos.x(), pos.y()), direction,
-                                       CVector(vel.x(), vel.y()))
+        for number in sorted(numbers):
+            pos, vel = api.pos(number), api.vel(number)
+            result[number] = Robot(number, CGeoPoint(pos.x(), pos.y()), heading(number),
+                                   CVector(vel.x(), vel.y()))
         return result
 
     ball = Ball.ball()
-    native_pos, native_vel = ball.Pos(), ball.Vel()
-    # 显式复制，传球 origin 等跨帧记录不依赖 C++ 视图是否复用底层内存。
-    pos = CGeoPoint(native_pos.x(), native_pos.y())
-    velocity = CVector(native_vel.x(), native_vel.y())
-    # 使用底层连续提供的球估计；不把 Valid 标志作为停止规划的开关。
+    pos, vel = ball.Pos(), ball.Vel()
     airborne = bool(ball.ChipBallState())
-    landing = None
-    if airborne:
-        predicted = ball.BestChipPredictPos()
-        # 飞行状态有效才用落点；无效预测不等于球已经落地。
-        if (finite(predicted) and abs(predicted.x()) < Params.pitchLength / 2
-                and abs(predicted.y()) < Params.pitchWidth / 2):
-            landing = CGeoPoint(predicted.x(), predicted.y())
-    return Frame(vision.getCycle(), pos, velocity,
-                 robots(Player, Player.direction), robots(Enemy, Enemy.dir),
-                 airborne, landing)
+    # 空中时直接采用底层预测落点，不加偏差距离或区域筛选。
+    landing = ball.BestChipPredictPos() if airborne else None
+    return Frame(vision.getCycle(), CGeoPoint(pos.x(), pos.y()), CVector(vel.x(), vel.y()),
+                 robots(Player, Player.direction, our_numbers),
+                 robots(Enemy, Enemy.dir, enemy_numbers), airborne, landing)
+
+
+def mouth_coordinates(robot, ball):
+    delta = ball - robot.pos
+    return (delta.x() * math.cos(robot.heading) + delta.y() * math.sin(robot.heading),
+            -delta.x() * math.sin(robot.heading) + delta.y() * math.cos(robot.heading))
 
 
 def in_mouth(robot, ball, cfg):
-    delta = ball - robot.pos
-    forward = delta.x() * math.cos(robot.heading) + delta.y() * math.sin(robot.heading)
-    lateral = -delta.x() * math.sin(robot.heading) + delta.y() * math.cos(robot.heading)
-    return (cfg.MOUTH_MIN <= forward <= cfg.MOUTH_MAX
-            and abs(lateral) <= cfg.MOUTH_HALF_WIDTH)
+    forward, lateral = mouth_coordinates(robot, ball)
+    return cfg.MOUTH_MIN <= forward <= cfg.MOUTH_MAX and abs(lateral) <= cfg.MOUTH_HALF_WIDTH
 
 
 def geometric_holder(robot, frame, cfg):
-    """口前几何 + 相对速度；飞越车顶/快速擦过不算稳定持球。"""
-    return (not frame.airborne and in_mouth(robot, frame.ball, cfg)
-            and (frame.velocity - robot.vel).mod() <= cfg.CONTROL_REL_SPEED)
+    """持球只看球相对车嘴的位置，不看速度、红外或空中标志。"""
+    return in_mouth(robot, frame.ball, cfg)
 
 
 def segment_distance(point, start, end):
-    """返回到有限线段的距离和未截断的投影比例，排除车后方的假挡线。"""
     dx, dy = end.x() - start.x(), end.y() - start.y()
     length2 = dx * dx + dy * dy
     if length2 < 1:
         return point.dist(start), 0.0
     t = ((point.x() - start.x()) * dx + (point.y() - start.y()) * dy) / length2
-    clamped = max(0.0, min(1.0, t))
-    projection = CGeoPoint(start.x() + clamped * dx, start.y() + clamped * dy)
-    return point.dist(projection), t
+    ratio = max(0.0, min(1.0, t))
+    return point.dist(CGeoPoint(start.x() + ratio * dx, start.y() + ratio * dy)), t
 
 
 def lane_blockers(start, end, robots, width, *, exclude=()):
@@ -109,42 +101,14 @@ def lane_blockers(start, end, robots, width, *, exclude=()):
     return blockers
 
 
-def legal(point, cfg):
-    margin = Params.playerRadius + cfg.FIELD_MARGIN
-    return (finite(point) and abs(point.x()) <= Params.pitchLength / 2 - margin
-            and abs(point.y()) <= Params.pitchWidth / 2 - margin
-            and not C.InOurPenaltyArea(point, margin)
-            and not C.InTheirPenaltyArea(point, margin))
-
-
-def legalize(point, cfg):
-    """只修正运动目标；传球落点若非法则直接拒绝，不能悄悄改落点。"""
-    margin = Params.playerRadius + cfg.FIELD_MARGIN
-    for _ in range(3):
-        point = C.MakeInField(point, margin)
-        if C.InOurPenaltyArea(point, margin):
-            point = C.MakeOutOfOurPenaltyArea(point, margin + 1)
-        if C.InTheirPenaltyArea(point, margin):
-            point = C.MakeOutOfTheirPenaltyArea(point, margin + 1)
-    return point if legal(point, cfg) else None
-
-
 def receive_pose(contact, origin, cfg):
-    """contact 是球的接触点，不是车中心；车在球行进方向的后面迎球。"""
     facing = (origin - contact).dir()
-    # 绑定只支持 点+向量、点-点，不支持 点-向量。
     return contact + vector(-cfg.MOUTH_OFFSET, facing), facing
 
 
 def receiving_points(cfg, side_y):
-    """先中央，再近侧中点、远侧中点、近侧边点、远侧边点；五点全部评分。
-
-    半径覆盖矩形禁区最远角，并加车体和接球余量。仅用 penaltyDepth
-    会使 30/150 度附近的车中心落入禁区。最终仍逐点检查合法性。
-    """
-    margin = Params.playerRadius + cfg.FIELD_MARGIN + cfg.MOUTH_OFFSET
-    radius = math.hypot(Params.penaltyDepth + margin,
-                        Params.penaltyWidth / 2 + margin) + cfg.ARC_EXTRA
+    """固定五个半圆点；返回顺序仅用于完全同分时稳定选择。"""
+    radius = math.hypot(Params.penaltyDepth, Params.penaltyWidth / 2) + cfg.ARC_EXTRA
     order = (90, 60, 120, 30, 150) if side_y >= 0 else (90, 120, 60, 150, 30)
     for degrees in order:
         angle = math.radians(degrees)
@@ -153,7 +117,7 @@ def receiving_points(cfg, side_y):
 
 
 def goal_targets(cfg):
-    y = max(0, Params.goalWidth / 2 - cfg.GOAL_INSET)
+    y = Params.goalWidth / 2 - cfg.GOAL_INSET
     return [CGeoPoint(Positions.theirGoal.x(), value) for value in (0, y, -y)]
 
 
