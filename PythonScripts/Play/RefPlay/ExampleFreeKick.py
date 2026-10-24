@@ -493,7 +493,7 @@ class FreeKickState(State):
             tasks["A"] = Task(Skill.StaticGetBallV4(
                 self.receive_pos,
                 direction=Ball.toPointDir(self.receive_pos),
-                power=KickPower(self.receive_pos), isChip=False))
+                power=KickPower(self.receive_pos), isChip=True))
         else:  # done：已踢出，A 停止本次传球。
             tasks["A"] = Task(Skill.Stop())
 
@@ -519,6 +519,7 @@ class FreeKickState(State):
     def transFunction(self):
         u.refreshHaveBallStatus()
         u.OurLastHolder = self.playerNum("A")
+        u.JustKickedOff = True
         if self.receive_pos is None:
             return ""
 

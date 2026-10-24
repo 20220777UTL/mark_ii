@@ -49,6 +49,7 @@ class parameters:
     AREA_G = [
         (CGeoPoint(4500, 500), CGeoPoint(4600, -500))
     ]
+    POWER_RATIO = 2.5
 
 """PARAMETERS ABOVE"""
 """UTIL FUNCTIONS BELOW"""
@@ -407,7 +408,7 @@ class NormalStates :
                 return "AttackFromGoalie"
             else :
                 return "AttackNormal"
-            return ""
+            
     class Defend(State):
         def getTasks(self):
             return {
@@ -519,7 +520,7 @@ class NormalStates :
                         ),
                         fixedNumber=self.Anum
                     )
-                    debugEngine.gui_debug_msg(p=Player.pos(self.Anum)+CVector(0,-150), msgstr="A:GetBall()")
+                    debugEngine.gui_debug_msg(p=Player.pos(self.Anum)+CVector(0,-150), msgstr="A:GetBallV5()")
                 # 计算B的任务
                 if self.Bstatus == "getball":
                     if self.Anum == -1:
@@ -533,9 +534,8 @@ class NormalStates :
                         debugEngine.gui_debug_msg(p=Player.pos(self.Bnum)+CVector(0,-150), msgstr="B:StaticGetBallV4(NextPoint,6000)")
                     else:
                         Btask = Task(
-                            StaticGetBallV4(
-                                pos = Player.pos(self.Anum),
-                                power=6000
+                            GetBallV5(
+                                direction=(Player.pos(self.Anum) - Player.pos(self.Bnum)).dir()
                             ),
                             fixedNumber=self.Bnum
                         )
@@ -554,13 +554,29 @@ class NormalStates :
                     debugEngine.gui_debug_msg(p=Player.pos(self.Bnum)+CVector(0,-150), msgstr="B:dribble:RushTo")
 
                 elif self.Bstatus == "shoot":
-                    Btask = Task(
-                        TurnAndShoot(
-                            target = Player.pos(self.Anum), power = 6000
-                        ),
-                        fixedNumber=self.Bnum
-                    )
-                    debugEngine.gui_debug_msg(p=Player.pos(self.Bnum)+CVector(0,-150), msgstr="B:TurnAndShoot(Apos,6000)")
+                    can_shoot = False
+
+                    for _ in range(p.MAX_ATTEMPTS):
+                        sample = u.sample_in_rectangles(p.AREA_G)
+                        if (u.available_path_simple(Ball.pos(), sample)):
+                            can_shoot = True
+                            Btask = Task(
+                                NormalShoot(
+                                    power=11500, isChip=False
+                                )
+                            )
+                            debugEngine.gui_debug_msg(p=Player.pos(self.Bnum)+CVector(0,-150), msgstr="B:NormalShoot(11500)")
+
+
+
+                    if not can_shoot:
+                        Btask = Task(
+                            TurnAndShoot(
+                                target = Player.pos(self.Anum), power = (Player.pos(self.Anum) - Player.pos(self.Bnum)).mod() * p.POWER_RATIO
+                            ),
+                            fixedNumber=self.Bnum
+                        )
+                        debugEngine.gui_debug_msg(p=Player.pos(self.Bnum)+CVector(0,-150), msgstr="B:TurnAndShoot(Apos,6000)")
                         
                 else:
                     # B 接下来应该去哪里？
@@ -581,7 +597,7 @@ class NormalStates :
             else: # AttackingStatus = "shoot"
                 Atask = None
                 Btask = Task(
-                    NormalShoot(power = 11000, isChip=False, flag=Flags.do_not_stop),
+                    NormalShoot(power = 11500, isChip=False, flag=Flags.do_not_stop),
                     fixedNumber=self.Bnum
                 )
                 debugEngine.gui_debug_msg(p=Player.pos(self.Bnum)+CVector(0,-150), msgstr="B:NormalShoot(11000)")
